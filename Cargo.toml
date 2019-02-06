@@ -41,10 +41,10 @@ members = [
 [dependencies]
 futures = "0.1"
 tokio-io = "0.1.4"
+tokio-trace = { git = "https://github.com/tokio-rs/tokio", branch = "eliza/tokio-trace" }
 bytes = "0.4.7"
 http = "0.1.8"
 byteorder = "1.0"
-log = "0.4.1"
 fnv = "1.0.5"
 slab = "0.4.0"
 string = "0.1"
