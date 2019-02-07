@@ -140,7 +140,7 @@ use http::{HeaderMap, Request, Response};
 use std::{convert, fmt, io, mem};
 use std::time::Duration;
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_trace::field;
+use tokio_trace::{field, Span};
 use tokio_trace_futures::{Instrument, Instrumented};
 
 /// In progress HTTP/2.0 connection handshake future.
@@ -159,14 +159,11 @@ use tokio_trace_futures::{Instrument, Instrumented};
 /// [module]: index.html
 #[must_use = "futures do nothing unless polled"]
 pub struct Handshake<T, B: IntoBuf = Bytes> {
-    inner: Instrumented<'static, HandshakeInner<T, B>>
-}
-
-struct HandshakeInner<T, B: IntoBuf> {
     /// The config to pass to Connection::new after handshake succeeds.
     builder: Builder,
     /// The current state of the handshake.
-    state: Handshaking<T, B>
+    state: Handshaking<T, B>,
+    span: Span<'static>,
 }
 
 /// Accepts inbound HTTP/2.0 streams on a connection.
@@ -215,6 +212,7 @@ struct HandshakeInner<T, B: IntoBuf> {
 #[must_use = "streams do nothing unless polled"]
 pub struct Connection<T, B: IntoBuf> {
     connection: proto::Connection<T, Peer, B>,
+    span: Span<'static>,
 }
 
 /// Builds server connections with custom configuration values.
@@ -391,8 +389,9 @@ where
             Handshaking::from(codec)
         });
         Handshake {
-            inner: HandshakeInner { builder, state }
-                .instrument(span)
+            builder,
+            state,
+            span,
         }
     }
 
@@ -432,7 +431,10 @@ where
     /// [`RecvStream`]: ../struct.RecvStream.html
     /// [`SendStream`]: ../struct.SendStream.html
     pub fn poll_close(&mut self) -> Poll<(), ::Error> {
-        self.connection.poll().map_err(Into::into)
+        let connection = &mut self.connection;
+        self.span.enter(|| {
+            connection.poll().map_err(Into::into)
+        })
     }
 
     #[deprecated(note="use abrupt_shutdown or graceful_shutdown instead", since="0.1.4")]
@@ -492,19 +494,22 @@ where
             },
             _ => {},
         }
+        let connection = &mut self.connection;
+        let span = &mut self.span;
+        span.enter(|| {
+            if let Some(inner) = connection.next_incoming() {
+                trace!("received incoming");
+                let (head, _) = inner.take_request().into_parts();
+                let body = RecvStream::new(ReleaseCapacity::new(inner.clone_to_opaque()));
 
-        if let Some(inner) = self.connection.next_incoming() {
-            trace!("received incoming");
-            let (head, _) = inner.take_request().into_parts();
-            let body = RecvStream::new(ReleaseCapacity::new(inner.clone_to_opaque()));
+                let request = Request::from_parts(head, body);
+                let respond = SendResponse { inner };
 
-            let request = Request::from_parts(head, body);
-            let respond = SendResponse { inner };
+                return Ok(Some((request, respond)).into());
+            }
 
-            return Ok(Some((request, respond)).into());
-        }
-
-        Ok(Async::NotReady)
+            Ok(Async::NotReady)
+        })
     }
 }
 
@@ -1083,6 +1088,7 @@ where
 }
 
 // ===== impl Handshake =====
+
 impl<T, B: IntoBuf> Future for Handshake<T, B>
     where T: AsyncRead + AsyncWrite,
           B: IntoBuf,
@@ -1091,68 +1097,64 @@ impl<T, B: IntoBuf> Future for Handshake<T, B>
     type Error = ::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.inner.poll()
-    }
-}
+        let state = &mut self.state;
+        let span = &mut self.span;
+        let builder = &self.builder;
+        let poll = span.enter(|| {
+            trace!({ state = field::debug(&state) }, "Handshake::poll()");
+            use server::Handshaking::*;
 
-impl<T, B: IntoBuf> Future for HandshakeInner<T, B>
-    where T: AsyncRead + AsyncWrite,
-          B: IntoBuf,
-{
-    type Item = Connection<T, B>;
-    type Error = ::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        trace!({ state = field::debug(&self.state) }, "Handshake::poll()");
-        use server::Handshaking::*;
-
-        self.state = if let Flushing(ref mut flush) = self.state {
-            // We're currently flushing a pending SETTINGS frame. Poll the
-            // flush future, and, if it's completed, advance our state to wait
-            // for the client preface.
-            let codec = match flush.poll()? {
-                Async::NotReady => {
-                    trace!(flush = field::display("NotReady"));
-                    return Ok(Async::NotReady);
-                },
-                Async::Ready(flushed) => {
-                    trace!(flush = field::display("Ready"));
-                    flushed
-                }
+            *state = if let Flushing(ref mut flush) = state {
+                // We're currently flushing a pending SETTINGS frame. Poll the
+                // flush future, and, if it's completed, advance our state to wait
+                // for the client preface.
+                let codec = match flush.poll()? {
+                    Async::NotReady => {
+                        trace!(flush = field::display("NotReady"));
+                        return Ok(Async::NotReady);
+                    },
+                    Async::Ready(flushed) => {
+                        trace!(flush = field::display("Ready"));
+                        flushed
+                    }
+                };
+                Handshaking::from(ReadPreface::new(codec))
+            } else {
+                // Otherwise, we haven't actually advanced the state, but we have
+                // to replace it with itself, because we have to return a value.
+                // (note that the assignment to `self.state` has to be outside of
+                // the `if let` block above in order to placate the borrow checker).
+                mem::replace(state, Handshaking::Empty)
             };
-            Handshaking::from(ReadPreface::new(codec))
-        } else {
-            // Otherwise, we haven't actually advanced the state, but we have
-            // to replace it with itself, because we have to return a value.
-            // (note that the assignment to `self.state` has to be outside of
-            // the `if let` block above in order to placate the borrow checker).
-            mem::replace(&mut self.state, Handshaking::Empty)
-        };
-        let poll = if let ReadingPreface(ref mut read) = self.state {
-            // We're now waiting for the client preface. Poll the `ReadPreface`
-            // future. If it has completed, we will create a `Connection` handle
-            // for the connection.
-            read.poll()
-            // Actually creating the `Connection` has to occur outside of this
-            // `if let` block, because we've borrowed `self` mutably in order
-            // to poll the state and won't be able to borrow the SETTINGS frame
-            // as well until we release the borrow for `poll()`.
-        } else {
-            unreachable!("Handshake::poll() state was not advanced completely!")
-        };
+            if let ReadingPreface(ref mut read) = state {
+                // We're now waiting for the client preface. Poll the `ReadPreface`
+                // future. If it has completed, we will create a `Connection` handle
+                // for the connection.
+                read.poll()
+                // Actually creating the `Connection` has to occur outside of this
+                // `if let` block, because we've borrowed `self` mutably in order
+                // to poll the state and won't be able to borrow the SETTINGS frame
+                // as well until we release the borrow for `poll()`.
+            } else {
+                unreachable!("Handshake::poll() state was not advanced completely!")
+            }
+        });
         let server = poll?.map(|codec| {
             let connection = proto::Connection::new(codec, Config {
                 next_stream_id: 2.into(),
                 // Server does not need to locally initiate any streams
                 initial_max_send_streams: 0,
-                reset_stream_duration: self.builder.reset_stream_duration,
-                reset_stream_max: self.builder.reset_stream_max,
-                settings: self.builder.settings.clone(),
+                reset_stream_duration: builder.reset_stream_duration,
+                reset_stream_max: builder.reset_stream_max,
+                settings: builder.settings.clone(),
             });
 
             trace!("Handshake::poll(); connection established!");
-            let mut c = Connection { connection };
-            if let Some(sz) = self.builder.initial_target_connection_window_size {
+            let mut c = Connection {
+                connection,
+                span: span!("server connection"),
+            };
+            if let Some(sz) = builder.initial_target_connection_window_size {
                 c.set_target_window_size(sz);
             }
             c
