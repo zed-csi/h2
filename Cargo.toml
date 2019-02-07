@@ -42,6 +42,7 @@ members = [
 futures = "0.1"
 tokio-io = "0.1.4"
 tokio-trace = { git = "https://github.com/tokio-rs/tokio", branch = "eliza/tokio-trace" }
+tokio-trace-futures = { git = "https://github.com/tokio-rs/tokio-trace-nursery" }
 bytes = "0.4.7"
 http = "0.1.8"
 byteorder = "1.0"
@@ -69,3 +70,6 @@ rustls = "0.12"
 tokio-rustls = "0.5.0"
 webpki = "0.18"
 webpki-roots = "0.14"
+
+[patch.crates-io]
+tokio-trace = { git = "https://github.com/tokio-rs/tokio", branch = "eliza/tokio-trace" }

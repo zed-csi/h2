@@ -108,6 +108,7 @@ extern crate slab;
 
 #[macro_use]
 extern crate tokio_trace;
+extern crate tokio_trace_futures;
 extern crate string;
 extern crate indexmap;
 

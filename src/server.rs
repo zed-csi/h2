@@ -140,6 +140,8 @@ use http::{HeaderMap, Request, Response};
 use std::{convert, fmt, io, mem};
 use std::time::Duration;
 use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_trace::field;
+use tokio_trace_futures::{Instrument, Instrumented};
 
 /// In progress HTTP/2.0 connection handshake future.
 ///
@@ -157,6 +159,10 @@ use tokio_io::{AsyncRead, AsyncWrite};
 /// [module]: index.html
 #[must_use = "futures do nothing unless polled"]
 pub struct Handshake<T, B: IntoBuf = Bytes> {
+    inner: Instrumented<'static, HandshakeInner<T, B>>
+}
+
+struct HandshakeInner<T, B: IntoBuf> {
     /// The config to pass to Connection::new after handshake succeeds.
     builder: Builder,
     /// The current state of the handshake.
@@ -287,9 +293,9 @@ pub struct SendResponse<B: IntoBuf> {
 /// Stages of an in-progress handshake.
 enum Handshaking<T, B: IntoBuf> {
     /// State 1. Connection is flushing pending SETTINGS frame.
-    Flushing(Flush<T, Prioritized<B::Buf>>),
+    Flushing(Instrumented<'static, Flush<T, Prioritized<B::Buf>>>),
     /// State 2. Connection is waiting for the client preface.
-    ReadingPreface(ReadPreface<T, Prioritized<B::Buf>>),
+    ReadingPreface(Instrumented<'static, ReadPreface<T, Prioritized<B::Buf>>>),
     /// Dummy state for `mem::replace`.
     Empty,
 }
@@ -363,26 +369,31 @@ where
     B: IntoBuf,
 {
     fn handshake2(io: T, builder: Builder) -> Handshake<T, B> {
-        // Create the codec.
-        let mut codec = Codec::new(io);
+        let mut span = span!("server handshake");
+        let state = span.enter(|| {
+            // Create the codec.
+            let mut codec = Codec::new(io);
 
-        if let Some(max) = builder.settings.max_frame_size() {
-            codec.set_max_recv_frame_size(max as usize);
+            if let Some(max) = builder.settings.max_frame_size() {
+                codec.set_max_recv_frame_size(max as usize);
+            }
+
+            if let Some(max) = builder.settings.max_header_list_size() {
+                codec.set_max_recv_header_list_size(max as usize);
+            }
+
+            // Send initial settings frame.
+            codec
+                .buffer(builder.settings.clone().into())
+                .expect("invalid SETTINGS frame");
+
+            // Create the handshake future.
+            Handshaking::from(codec)
+        });
+        Handshake {
+            inner: HandshakeInner { builder, state }
+                .instrument(span)
         }
-
-        if let Some(max) = builder.settings.max_header_list_size() {
-            codec.set_max_recv_header_list_size(max as usize);
-        }
-
-        // Send initial settings frame.
-        codec
-            .buffer(builder.settings.clone().into())
-            .expect("invalid SETTINGS frame");
-
-        // Create the handshake future.
-        let state = Handshaking::from(codec);
-
-        Handshake { builder, state }
     }
 
     /// Sets the target window size for the whole connection.
@@ -1000,10 +1011,10 @@ impl<B: IntoBuf> SendResponse<B> {
 // ===== impl Flush =====
 
 impl<T, B: Buf> Flush<T, B> {
-    fn new(codec: Codec<T, B>) -> Self {
+    fn new(codec: Codec<T, B>) -> Instrumented<'static, Self> {
         Flush {
             codec: Some(codec),
-        }
+        }.instrument(span!("Flush"))
     }
 }
 
@@ -1025,11 +1036,11 @@ where
 }
 
 impl<T, B: Buf> ReadPreface<T, B> {
-    fn new(codec: Codec<T, B>) -> Self {
+    fn new(codec: Codec<T, B>) -> Instrumented<'static, Self> {
         ReadPreface {
             codec: Some(codec),
             pos: 0,
-        }
+        }.instrument(span!("ReadPreface"))
     }
 
     fn inner_mut(&mut self) -> &mut T {
@@ -1072,7 +1083,6 @@ where
 }
 
 // ===== impl Handshake =====
-
 impl<T, B: IntoBuf> Future for Handshake<T, B>
     where T: AsyncRead + AsyncWrite,
           B: IntoBuf,
@@ -1081,7 +1091,19 @@ impl<T, B: IntoBuf> Future for Handshake<T, B>
     type Error = ::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        trace!("Handshake::poll(); state={:?};", self.state);
+        self.inner.poll()
+    }
+}
+
+impl<T, B: IntoBuf> Future for HandshakeInner<T, B>
+    where T: AsyncRead + AsyncWrite,
+          B: IntoBuf,
+{
+    type Item = Connection<T, B>;
+    type Error = ::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        trace!({ state = field::debug(&self.state) }, "Handshake::poll()");
         use server::Handshaking::*;
 
         self.state = if let Flushing(ref mut flush) = self.state {
@@ -1090,11 +1112,11 @@ impl<T, B: IntoBuf> Future for Handshake<T, B>
             // for the client preface.
             let codec = match flush.poll()? {
                 Async::NotReady => {
-                    trace!("Handshake::poll(); flush.poll()=NotReady");
+                    trace!(flush = field::display("NotReady"));
                     return Ok(Async::NotReady);
                 },
                 Async::Ready(flushed) => {
-                    trace!("Handshake::poll(); flush.poll()=Ready");
+                    trace!(flush = field::display("Ready"));
                     flushed
                 }
             };
@@ -1292,23 +1314,23 @@ where
     }
 }
 
-impl<T, B> convert::From<Flush<T, Prioritized<B::Buf>>> for Handshaking<T, B>
+impl<T, B> convert::From<Instrumented<'static, Flush<T, Prioritized<B::Buf>>>> for Handshaking<T, B>
 where
     T: AsyncRead + AsyncWrite,
     B: IntoBuf,
 {
-    #[inline] fn from(flush: Flush<T, Prioritized<B::Buf>>) -> Self {
+    #[inline] fn from(flush: Instrumented<'static, Flush<T, Prioritized<B::Buf>>>) -> Self {
         Handshaking::Flushing(flush)
     }
 }
 
-impl<T, B> convert::From<ReadPreface<T, Prioritized<B::Buf>>> for
+impl<T, B> convert::From<Instrumented<'static, ReadPreface<T, Prioritized<B::Buf>>>> for
     Handshaking<T, B>
 where
     T: AsyncRead + AsyncWrite,
     B: IntoBuf,
 {
-    #[inline] fn from(read: ReadPreface<T, Prioritized<B::Buf>>) -> Self {
+    #[inline] fn from(read: Instrumented<'static, ReadPreface<T, Prioritized<B::Buf>>>) -> Self {
         Handshaking::ReadingPreface(read)
     }
 }
