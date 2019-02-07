@@ -6,6 +6,7 @@ use hpack;
 use bytes::{Buf, BufMut, BytesMut};
 use futures::*;
 use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_trace::field;
 
 use std::io::{self, Cursor};
 
@@ -91,126 +92,126 @@ where
         // Ensure that we have enough capacity to accept the write.
         assert!(self.has_capacity());
 
-        debug!("send; frame={:?}", item);
+        span!("send", frame = field::debug(&item)).enter(|| {
+            match item {
+                Frame::Data(mut v) => {
+                    // Ensure that the payload is not greater than the max frame.
+                    let len = v.payload().remaining();
 
-        match item {
-            Frame::Data(mut v) => {
-                // Ensure that the payload is not greater than the max frame.
-                let len = v.payload().remaining();
+                    if len > self.max_frame_size() {
+                        return Err(PayloadTooBig);
+                    }
 
-                if len > self.max_frame_size() {
-                    return Err(PayloadTooBig);
-                }
+                    if len >= CHAIN_THRESHOLD {
+                        let head = v.head();
 
-                if len >= CHAIN_THRESHOLD {
-                    let head = v.head();
+                        // Encode the frame head to the buffer
+                        head.encode(len, self.buf.get_mut());
 
-                    // Encode the frame head to the buffer
-                    head.encode(len, self.buf.get_mut());
+                        // Save the data frame
+                        self.next = Some(Next::Data(v));
+                    } else {
+                        v.encode_chunk(self.buf.get_mut());
 
-                    // Save the data frame
-                    self.next = Some(Next::Data(v));
-                } else {
-                    v.encode_chunk(self.buf.get_mut());
+                        // The chunk has been fully encoded, so there is no need to
+                        // keep it around
+                        assert_eq!(v.payload().remaining(), 0, "chunk not fully encoded");
 
-                    // The chunk has been fully encoded, so there is no need to
-                    // keep it around
-                    assert_eq!(v.payload().remaining(), 0, "chunk not fully encoded");
+                        // Save off the last frame...
+                        self.last_data_frame = Some(v);
+                    }
+                },
+                Frame::Headers(v) => {
+                    if let Some(continuation) = v.encode(&mut self.hpack, self.buf.get_mut()) {
+                        self.next = Some(Next::Continuation(continuation));
+                    }
+                },
+                Frame::PushPromise(v) => {
+                    if let Some(continuation) = v.encode(&mut self.hpack, self.buf.get_mut()) {
+                        self.next = Some(Next::Continuation(continuation));
+                    }
+                },
+                Frame::Settings(v) => {
+                    v.encode(self.buf.get_mut());
+                    trace!(encoded = field::display("settings"), rem = self.buf.remaining());
+                },
+                Frame::GoAway(v) => {
+                    v.encode(self.buf.get_mut());
+                    trace!(encoded = field::display("go_away"), rem = self.buf.remaining());
+                },
+                Frame::Ping(v) => {
+                    v.encode(self.buf.get_mut());
+                    trace!(encoded = field::display("ping"), rem = self.buf.remaining());
+                },
+                Frame::WindowUpdate(v) => {
+                    v.encode(self.buf.get_mut());
+                    trace!(encoded = field::display("window_update"), rem = self.buf.remaining());
+                },
 
-                    // Save off the last frame...
-                    self.last_data_frame = Some(v);
-                }
-            },
-            Frame::Headers(v) => {
-                if let Some(continuation) = v.encode(&mut self.hpack, self.buf.get_mut()) {
-                    self.next = Some(Next::Continuation(continuation));
-                }
-            },
-            Frame::PushPromise(v) => {
-                if let Some(continuation) = v.encode(&mut self.hpack, self.buf.get_mut()) {
-                    self.next = Some(Next::Continuation(continuation));
-                }
-            },
-            Frame::Settings(v) => {
-                v.encode(self.buf.get_mut());
-                trace!("encoded settings; rem={:?}", self.buf.remaining());
-            },
-            Frame::GoAway(v) => {
-                v.encode(self.buf.get_mut());
-                trace!("encoded go_away; rem={:?}", self.buf.remaining());
-            },
-            Frame::Ping(v) => {
-                v.encode(self.buf.get_mut());
-                trace!("encoded ping; rem={:?}", self.buf.remaining());
-            },
-            Frame::WindowUpdate(v) => {
-                v.encode(self.buf.get_mut());
-                trace!("encoded window_update; rem={:?}", self.buf.remaining());
-            },
+                Frame::Priority(_) => {
+                    /*
+                    v.encode(self.buf.get_mut());
+                    trace!("encoded priority; rem={:?}", self.buf.remaining());
+                    */
+                    unimplemented!();
+                },
+                Frame::Reset(v) => {
+                    v.encode(self.buf.get_mut());
+                    trace!(encoded = field::display("reset"), rem = self.buf.remaining());
+                },
+            }
 
-            Frame::Priority(_) => {
-                /*
-                v.encode(self.buf.get_mut());
-                trace!("encoded priority; rem={:?}", self.buf.remaining());
-                */
-                unimplemented!();
-            },
-            Frame::Reset(v) => {
-                v.encode(self.buf.get_mut());
-                trace!("encoded reset; rem={:?}", self.buf.remaining());
-            },
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Flush buffered data to the wire
     pub fn flush(&mut self) -> Poll<(), io::Error> {
-        trace!("flush");
-
-        loop {
-            while !self.is_empty() {
-                match self.next {
-                    Some(Next::Data(ref mut frame)) => {
-                        trace!("  -> queued data frame");
-                        let mut buf = Buf::by_ref(&mut self.buf).chain(frame.payload_mut());
-                        try_ready!(self.inner.write_buf(&mut buf));
-                    },
-                    _ => {
-                        trace!("  -> not a queued data frame");
-                        try_ready!(self.inner.write_buf(&mut self.buf));
-                    },
-                }
-            }
-
-            // Clear internal buffer
-            self.buf.set_position(0);
-            self.buf.get_mut().clear();
-
-            // The data frame has been written, so unset it
-            match self.next.take() {
-                Some(Next::Data(frame)) => {
-                    self.last_data_frame = Some(frame);
-                    debug_assert!(self.is_empty());
-                    break;
-                },
-                Some(Next::Continuation(frame)) => {
-                    // Buffer the continuation frame, then try to write again
-                    if let Some(continuation) = frame.encode(&mut self.hpack, self.buf.get_mut()) {
-                        self.next = Some(Next::Continuation(continuation));
+        span!("flush").enter(|| {
+            loop {
+                while !self.is_empty() {
+                    match self.next {
+                        Some(Next::Data(ref mut frame)) => {
+                            trace!("  -> queued data frame");
+                            let mut buf = Buf::by_ref(&mut self.buf).chain(frame.payload_mut());
+                            try_ready!(self.inner.write_buf(&mut buf));
+                        },
+                        _ => {
+                            trace!("  -> not a queued data frame");
+                            try_ready!(self.inner.write_buf(&mut self.buf));
+                        },
                     }
-                },
-                None => {
-                    break;
+                }
+
+                // Clear internal buffer
+                self.buf.set_position(0);
+                self.buf.get_mut().clear();
+
+                // The data frame has been written, so unset it
+                match self.next.take() {
+                    Some(Next::Data(frame)) => {
+                        self.last_data_frame = Some(frame);
+                        debug_assert!(self.is_empty());
+                        break;
+                    },
+                    Some(Next::Continuation(frame)) => {
+                        // Buffer the continuation frame, then try to write again
+                        if let Some(continuation) = frame.encode(&mut self.hpack, self.buf.get_mut()) {
+                            self.next = Some(Next::Continuation(continuation));
+                        }
+                    },
+                    None => {
+                        break;
+                    }
                 }
             }
-        }
 
-        trace!("flushing buffer");
-        // Flush the upstream
-        try_nb!(self.inner.flush());
+            trace!("flushing buffer");
+            // Flush the upstream
+            try_nb!(self.inner.flush());
 
-        Ok(Async::Ready(()))
+            Ok(Async::Ready(()))
+        })
     }
 
     /// Close the codec

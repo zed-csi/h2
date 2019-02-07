@@ -2,6 +2,8 @@ use codec::RecvError;
 use frame;
 use proto::*;
 
+use tokio_trace::field;
+
 #[derive(Debug)]
 pub(crate) struct Settings {
     /// Received SETTINGS frame pending processing. The ACK must be written to
@@ -38,33 +40,33 @@ impl Settings {
         C: Buf,
         P: Peer,
     {
-        trace!("send_pending_ack; pending={:?}", self.pending);
+        span!("send_pending_ack", pending = field::debug(&self.pending)).enter(|| {
+            if let Some(ref settings) = self.pending {
+                if !dst.poll_ready()?.is_ready() {
+                    trace!("failed to send ACK");
+                    return Ok(Async::NotReady);
+                }
 
-        if let Some(ref settings) = self.pending {
-            if !dst.poll_ready()?.is_ready() {
-                trace!("failed to send ACK");
-                return Ok(Async::NotReady);
+                // Create an ACK settings frame
+                let frame = frame::Settings::ack();
+
+                // Buffer the settings frame
+                dst.buffer(frame.into())
+                    .ok()
+                    .expect("invalid settings frame");
+
+                trace!("ACK sent; applying settings");
+
+                if let Some(val) = settings.max_frame_size() {
+                    dst.set_max_send_frame_size(val as usize);
+                }
+
+                streams.apply_remote_settings(settings)?;
             }
 
-            // Create an ACK settings frame
-            let frame = frame::Settings::ack();
+            self.pending = None;
 
-            // Buffer the settings frame
-            dst.buffer(frame.into())
-                .ok()
-                .expect("invalid settings frame");
-
-            trace!("ACK sent; applying settings");
-
-            if let Some(val) = settings.max_frame_size() {
-                dst.set_max_send_frame_size(val as usize);
-            }
-
-            streams.apply_remote_settings(settings)?;
-        }
-
-        self.pending = None;
-
-        Ok(().into())
+            Ok(().into())
+        })
     }
 }
