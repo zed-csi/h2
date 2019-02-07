@@ -23,9 +23,6 @@ use tokio_trace_futures::WithSubscriber;
 pub fn main() {
     let _ = env_logger::try_init();
     let subscriber = tokio_trace_log::TraceLogger::builder()
-        .with_span_entry(true)
-        .with_span_exits(true)
-        .with_span_closes(true)
         .with_parent_fields(true)
         .finish();
     let subscriber = tokio_trace::Dispatch::new(subscriber);
