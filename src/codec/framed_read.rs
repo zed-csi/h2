@@ -319,19 +319,21 @@ where
     type Error = RecvError;
 
     fn poll(&mut self) -> Poll<Option<Frame>, Self::Error> {
-        loop {
-            trace!("poll");
-            let bytes = match try_ready!(self.inner.poll().map_err(map_err)) {
-                Some(bytes) => bytes,
-                None => return Ok(Async::Ready(None)),
-            };
+        span!("FramedRead").enter(|| {
+            loop {
+                trace!("poll");
+                let bytes = match try_ready!(self.inner.poll().map_err(map_err)) {
+                    Some(bytes) => bytes,
+                    None => return Ok(Async::Ready(None)),
+                };
 
-            trace!({ bytes = bytes.len() }, "poll");
-            if let Some(frame) = self.decode_frame(bytes)? {
-                debug!({ frame = field::debug(&frame) }, "received");
-                return Ok(Async::Ready(Some(frame)));
+                trace!({ bytes = bytes.len() }, "poll");
+                if let Some(frame) = self.decode_frame(bytes)? {
+                    debug!({ frame = field::debug(&frame) }, "received");
+                    return Ok(Async::Ready(Some(frame)));
+                }
             }
-        }
+        })
     }
 }
 

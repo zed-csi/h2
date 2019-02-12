@@ -167,7 +167,7 @@ where
 
     /// Flush buffered data to the wire
     pub fn flush(&mut self) -> Poll<(), io::Error> {
-        span!("flush").enter(|| {
+        span!("FramedWrite::flush").enter(|| {
             loop {
                 while !self.is_empty() {
                     match self.next {
@@ -216,8 +216,10 @@ where
 
     /// Close the codec
     pub fn shutdown(&mut self) -> Poll<(), io::Error> {
-        try_ready!(self.flush());
-        self.inner.shutdown().map_err(Into::into)
+        span!("FramedWrite::shutdown").enter(|| {
+            try_ready!(self.flush());
+            self.inner.shutdown().map_err(Into::into)
+        })
     }
 
     fn has_capacity(&self) -> bool {

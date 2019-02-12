@@ -1,6 +1,7 @@
 use super::*;
 
 use std::usize;
+use tokio_trace::field;
 
 #[derive(Debug)]
 pub(super) struct Counts {
@@ -133,17 +134,15 @@ impl Counts {
 
     // TODO: move this to macro?
     pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
-        trace!("transition_after; stream={:?}; state={:?}; is_closed={:?}; \
-               pending_send_empty={:?}; buffered_send_data={}; \
-               num_recv={}; num_send={}",
-               stream.id,
-               stream.state,
-               stream.is_closed(),
-               stream.pending_send.is_empty(),
-               stream.buffered_send_data,
-               self.num_recv_streams,
-               self.num_send_streams);
-
+        trace!(
+            message = "transition_after",
+            state = field::debug(&stream.state),
+            is_closed = stream.is_closed(),
+            pending_send_empty = stream.pending_send.is_empty(),
+            buffered_send_data = field::display(&stream.buffered_send_data),
+            num_recv = self.num_recv_streams,
+            num_send = self.num_send_streams
+        );
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
                 stream.unlink();
@@ -154,7 +153,7 @@ impl Counts {
             }
 
             if stream.is_counted {
-                trace!("dec_num_streams; stream={:?}", stream.id);
+                trace!(message = "transition_after: dec_num_streams;", stream = field::debug(&stream.id));
                 // Decrement the number of active streams.
                 self.dec_num_streams(&mut stream);
             }
@@ -164,6 +163,7 @@ impl Counts {
         if stream.is_released() {
             stream.remove();
         }
+
     }
 
     fn dec_num_streams(&mut self, stream: &mut store::Ptr) {

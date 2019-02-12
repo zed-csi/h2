@@ -3,6 +3,8 @@ use proto::{WindowSize, MAX_WINDOW_SIZE};
 
 use std::fmt;
 
+use tokio_trace::field::display;
+
 // We don't want to send WINDOW_UPDATE frames for tiny changes, but instead
 // aggregate them when the changes are significant. Many implementations do
 // this by keeping a "ratio" of the update version the allowed window size.
@@ -121,10 +123,10 @@ impl FlowControl {
         }
 
         trace!(
-            "inc_window; sz={}; old={}; new={}",
-            sz,
-            self.window_size,
-            val
+            message = "inc_window;",
+            sz = display(sz),
+            old = display(self.window_size),
+            new = display(val)
         );
 
         self.window_size = Window(val);
@@ -137,10 +139,10 @@ impl FlowControl {
     /// INITIAL_WINDOW_SIZE value.
     pub fn dec_window(&mut self, sz: WindowSize) {
         trace!(
-            "dec_window; sz={}; window={}, available={}",
-            sz,
-            self.window_size,
-            self.available
+            message = "dec_window;",
+            sz = display(sz),
+            window = display(self.window_size),
+            available = display(self.available)
         );
         // This should not be able to overflow `window_size` from the bottom.
         self.window_size -= sz;
@@ -150,10 +152,10 @@ impl FlowControl {
     /// must ensure that the window has capacity.
     pub fn send_data(&mut self, sz: WindowSize) {
         trace!(
-            "send_data; sz={}; window={}; available={}",
-            sz,
-            self.window_size,
-            self.available
+            message = "send_data;",
+            sz = display(sz),
+            window = display(self.window_size),
+            available = display(self.available)
         );
 
         // Ensure that the argument is correct

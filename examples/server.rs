@@ -7,7 +7,7 @@ extern crate tokio;
 
 #[macro_use]
 extern crate tokio_trace;
-extern crate tokio_trace_log;
+extern crate tokio_trace_fmt;
 extern crate tokio_trace_futures;
 
 use h2::server;
@@ -22,8 +22,8 @@ use tokio_trace_futures::WithSubscriber;
 
 pub fn main() {
     let _ = env_logger::try_init();
-    let subscriber = tokio_trace_log::TraceLogger::builder()
-        .with_parent_fields(true)
+    let subscriber = tokio_trace_fmt::FmtSubscriber::builder()
+        .full()
         .finish();
     let subscriber = tokio_trace::Dispatch::new(subscriber);
 

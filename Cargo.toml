@@ -71,7 +71,8 @@ tokio-rustls = "0.5.0"
 webpki = "0.18"
 webpki-roots = "0.14"
 
-tokio-trace-log = { git = "https://github.com/tokio-rs/tokio-trace-nursery", branch = "eliza/update" }
+tokio-trace-log = { git = "https://github.com/tokio-rs/tokio-trace-nursery" }
+tokio-trace-fmt = { git = "https://github.com/tokio-rs/tokio-trace-nursery", branch = "eliza/fmt" }
 
 [patch.crates-io]
 tokio-trace = { git = "https://github.com/tokio-rs/tokio", branch = "eliza/tokio-trace" }

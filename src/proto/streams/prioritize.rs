@@ -493,7 +493,7 @@ impl Prioritize {
 
                 match self.pop_frame(buffer, store, max_frame_len, counts) {
                     Some(frame) => {
-                        trace!(message = display("writing"), frame = debug(&frame));
+                        trace!(message = "writing", frame = debug(&frame));
 
                         debug_assert_eq!(self.in_flight_data_frame, InFlightData::Nothing);
                         if let Frame::Data(ref frame) = frame {

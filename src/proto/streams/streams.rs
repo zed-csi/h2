@@ -14,6 +14,8 @@ use tokio_io::AsyncWrite;
 use std::{fmt, io};
 use std::sync::{Arc, Mutex};
 
+use tokio_trace::field;
+
 #[derive(Debug)]
 pub(crate) struct Streams<B, P>
 where
@@ -128,128 +130,128 @@ where
     /// Process inbound headers
     pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), RecvError> {
         let id = frame.stream_id();
-        let mut me = self.inner.lock().unwrap();
-        let me = &mut *me;
+        span!("recv_headers", stream = field::debug(id)).enter(|| {
+            let mut me = self.inner.lock().unwrap();
+            let me = &mut *me;
 
-        // The GOAWAY process has begun. All streams with a greater ID than
-        // specified as part of GOAWAY should be ignored.
-        if id > me.actions.recv.max_stream_id() {
-            trace!("id ({:?}) > max_stream_id ({:?}), ignoring HEADERS", id, me.actions.recv.max_stream_id());
-            return Ok(());
-        }
+            // The GOAWAY process has begun. All streams with a greater ID than
+            // specified as part of GOAWAY should be ignored.
+            if id > me.actions.recv.max_stream_id() {
+                trace!("id ({:?}) > max_stream_id ({:?}), ignoring HEADERS", id, me.actions.recv.max_stream_id());
+                return Ok(());
+            }
 
-        let key = match me.store.find_entry(id) {
-            Entry::Occupied(e) => e.key(),
-            Entry::Vacant(e) => match me.actions.recv.open(id, Open::Headers, &mut me.counts)? {
-                Some(stream_id) => {
-                    let stream = Stream::new(
-                        stream_id,
-                        me.actions.send.init_window_sz(),
-                        me.actions.recv.init_window_sz(),
-                    );
+            let key = match me.store.find_entry(id) {
+                Entry::Occupied(e) => e.key(),
+                Entry::Vacant(e) => match me.actions.recv.open(id, Open::Headers, &mut me.counts)? {
+                    Some(stream_id) => {
+                        let stream = Stream::new(
+                            stream_id,
+                            me.actions.send.init_window_sz(),
+                            me.actions.recv.init_window_sz(),
+                        );
 
-                    e.insert(stream)
-                },
-                None => return Ok(()),
-            },
-        };
-
-        let stream = me.store.resolve(key);
-
-        if stream.state.is_local_reset() {
-            // Locally reset streams must ignore frames "for some time".
-            // This is because the remote may have sent trailers before
-            // receiving the RST_STREAM frame.
-            trace!("recv_headers; ignoring trailers on {:?}", stream.id);
-            return Ok(());
-        }
-
-        let actions = &mut me.actions;
-        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
-        let send_buffer = &mut *send_buffer;
-
-        me.counts.transition(stream, |counts, stream| {
-            trace!(
-                "recv_headers; stream={:?}; state={:?}",
-                stream.id,
-                stream.state
-            );
-
-            let res = if stream.state.is_recv_headers() {
-                match actions.recv.recv_headers(frame, stream, counts) {
-                    Ok(()) => Ok(()),
-                    Err(RecvHeaderBlockError::Oversize(resp)) => {
-                        if let Some(resp) = resp {
-                            let _ = actions.send.send_headers(
-                                resp, send_buffer, stream, counts, &mut actions.task);
-
-                            actions.send.schedule_implicit_reset(
-                                stream,
-                                Reason::REFUSED_STREAM,
-                                counts,
-                                &mut actions.task);
-
-                            actions.recv.enqueue_reset_expiration(stream, counts);
-
-                            Ok(())
-                        } else {
-                            Err(RecvError::Stream {
-                                id: stream.id,
-                                reason: Reason::REFUSED_STREAM,
-                            })
-                        }
+                        e.insert(stream)
                     },
-                    Err(RecvHeaderBlockError::State(err)) => Err(err),
-                }
-            } else {
-                if !frame.is_end_stream() {
-                    // TODO: Is this the right error
-                    return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
-                }
-
-                actions.recv.recv_trailers(frame, stream)
+                    None => return Ok(()),
+                },
             };
 
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            let stream = me.store.resolve(key);
+
+            if stream.state.is_local_reset() {
+                // Locally reset streams must ignore frames "for some time".
+                // This is because the remote may have sent trailers before
+                // receiving the RST_STREAM frame.
+                trace!("ignoring trailers");
+                return Ok(());
+            }
+
+            let actions = &mut me.actions;
+            let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+            let send_buffer = &mut *send_buffer;
+
+            me.counts.transition(stream, |counts, stream| {
+                trace!(state = field::debug(&stream.state));
+
+                let res = if stream.state.is_recv_headers() {
+                    match actions.recv.recv_headers(frame, stream, counts) {
+                        Ok(()) => Ok(()),
+                        Err(RecvHeaderBlockError::Oversize(resp)) => {
+                            if let Some(resp) = resp {
+                                let _ = actions.send.send_headers(
+                                    resp, send_buffer, stream, counts, &mut actions.task);
+
+                                actions.send.schedule_implicit_reset(
+                                    stream,
+                                    Reason::REFUSED_STREAM,
+                                    counts,
+                                    &mut actions.task);
+
+                                actions.recv.enqueue_reset_expiration(stream, counts);
+
+                                Ok(())
+                            } else {
+                                Err(RecvError::Stream {
+                                    id: stream.id,
+                                    reason: Reason::REFUSED_STREAM,
+                                })
+                            }
+                        },
+                        Err(RecvHeaderBlockError::State(err)) => Err(err),
+                    }
+                } else {
+                    if !frame.is_end_stream() {
+                        // TODO: Is this the right error
+                        return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+                    }
+
+                    actions.recv.recv_trailers(frame, stream)
+                };
+
+                actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            })
         })
     }
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), RecvError> {
-        let mut me = self.inner.lock().unwrap();
-        let me = &mut *me;
-
         let id = frame.stream_id();
 
-        let stream = match me.store.find_mut(&id) {
-            Some(stream) => stream,
-            None => {
-                // The GOAWAY process has begun. All streams with a greater ID
-                // than specified as part of GOAWAY should be ignored.
-                if id > me.actions.recv.max_stream_id() {
-                    trace!("id ({:?}) > max_stream_id ({:?}), ignoring DATA", id, me.actions.recv.max_stream_id());
-                    return Ok(());
+        span!("recv_data", stream = field::debug(id)).enter(|| {
+            let mut me = self.inner.lock().unwrap();
+            let me = &mut *me;
+
+            let stream = match me.store.find_mut(&id) {
+                Some(stream) => stream,
+                None => {
+                    // The GOAWAY process has begun. All streams with a greater ID
+                    // than specified as part of GOAWAY should be ignored.
+                    if id > me.actions.recv.max_stream_id() {
+                        trace!("id ({:?}) > max_stream_id ({:?}), ignoring DATA", id, me.actions.recv.max_stream_id());
+                        return Ok(());
+                    }
+
+                    trace!("stream not found: {:?}", id);
+                    return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+                },
+            };
+
+            let actions = &mut me.actions;
+            let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+            let send_buffer = &mut *send_buffer;
+
+            me.counts.transition(stream, |counts, stream| {
+                let sz = frame.payload().len();
+                let res = actions.recv.recv_data(frame, stream);
+
+                // Any stream error after receiving a DATA frame means
+                // we won't give the data to the user, and so they can't
+                // release the capacity. We do it automatically.
+                if let Err(RecvError::Stream { .. }) = res {
+                    actions.recv.release_connection_capacity(sz as WindowSize, &mut None);
                 }
-
-                trace!("recv_data; stream not found: {:?}", id);
-                return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
-            },
-        };
-
-        let actions = &mut me.actions;
-        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
-        let send_buffer = &mut *send_buffer;
-
-        me.counts.transition(stream, |counts, stream| {
-            let sz = frame.payload().len();
-            let res = actions.recv.recv_data(frame, stream);
-
-            // Any stream error after receiving a DATA frame means
-            // we won't give the data to the user, and so they can't
-            // release the capacity. We do it automatically.
-            if let Err(RecvError::Stream { .. }) = res {
-                actions.recv.release_connection_capacity(sz as WindowSize, &mut None);
-            }
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+                actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            })
         })
     }
 

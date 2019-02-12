@@ -179,63 +179,63 @@ impl Decoder {
         if let Some(size) = self.max_size_update.take() {
             self.last_max_update = size;
         }
+        span!("decode").enter(|| {
+            while let Some(ty) = peek_u8(src) {
+                // At this point we are always at the beginning of the next block
+                // within the HPACK data. The type of the block can always be
+                // determined from the first byte.
+                match Representation::load(ty)? {
+                    Indexed => {
+                        trace!(message = "Indexed", rem = src.remaining());
+                        can_resize = false;
+                        let entry = self.decode_indexed(src)?;
+                        consume(src);
+                        f(entry);
+                    },
+                    LiteralWithIndexing => {
+                        trace!(message = "LiteralWithIndexing", rem = src.remaining());
+                        can_resize = false;
+                        let entry = self.decode_literal(src, true)?;
 
-        trace!("decode");
+                        // Insert the header into the table
+                        self.table.insert(entry.clone());
+                        consume(src);
 
-        while let Some(ty) = peek_u8(src) {
-            // At this point we are always at the beginning of the next block
-            // within the HPACK data. The type of the block can always be
-            // determined from the first byte.
-            match Representation::load(ty)? {
-                Indexed => {
-                    trace!("    Indexed; rem={:?}", src.remaining());
-                    can_resize = false;
-                    let entry = self.decode_indexed(src)?;
-                    consume(src);
-                    f(entry);
-                },
-                LiteralWithIndexing => {
-                    trace!("    LiteralWithIndexing; rem={:?}", src.remaining());
-                    can_resize = false;
-                    let entry = self.decode_literal(src, true)?;
+                        f(entry);
+                    },
+                    LiteralWithoutIndexing => {
+                        trace!(message = "LiteralWithoutIndexing", rem = src.remaining());
+                        can_resize = false;
+                        let entry = self.decode_literal(src, false)?;
+                        consume(src);
+                        f(entry);
+                    },
+                    LiteralNeverIndexed => {
+                        trace!(message = "LiteralNeverIndexed", rem = src.remaining());
+                        can_resize = false;
+                        let entry = self.decode_literal(src, false)?;
+                        consume(src);
 
-                    // Insert the header into the table
-                    self.table.insert(entry.clone());
-                    consume(src);
+                        // TODO: Track that this should never be indexed
 
-                    f(entry);
-                },
-                LiteralWithoutIndexing => {
-                    trace!("    LiteralWithoutIndexing; rem={:?}", src.remaining());
-                    can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
-                    consume(src);
-                    f(entry);
-                },
-                LiteralNeverIndexed => {
-                    trace!("    LiteralNeverIndexed; rem={:?}", src.remaining());
-                    can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
-                    consume(src);
+                        f(entry);
+                    },
+                    SizeUpdate => {
+                        trace!(message = "SizeUpdate", rem = src.remaining());
+                        if !can_resize {
+                            return Err(DecoderError::InvalidMaxDynamicSize);
+                        }
 
-                    // TODO: Track that this should never be indexed
-
-                    f(entry);
-                },
-                SizeUpdate => {
-                    trace!("    SizeUpdate; rem={:?}", src.remaining());
-                    if !can_resize {
-                        return Err(DecoderError::InvalidMaxDynamicSize);
-                    }
-
-                    // Handle the dynamic table size update
-                    self.process_size_update(src)?;
-                    consume(src);
-                },
+                        // Handle the dynamic table size update
+                        self.process_size_update(src)?;
+                        consume(src);
+                    },
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
+
     }
 
     fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
@@ -300,9 +300,9 @@ impl Decoder {
 
         if len > buf.remaining() {
             trace!(
-                "decode_string underflow; len={}; remaining={}",
-                len,
-                buf.remaining()
+                message = "decode_string underflow",
+                len = len,
+                rem = buf.remaining()
             );
             return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
         }

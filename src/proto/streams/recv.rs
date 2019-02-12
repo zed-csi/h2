@@ -8,6 +8,8 @@ use http::{HeaderMap, Response, Request, Method};
 use std::io;
 use std::time::{Duration, Instant};
 
+use tokio_trace::field;
+
 #[derive(Debug)]
 pub(super) struct Recv {
     /// Initial window size of remote initiated streams
@@ -158,81 +160,85 @@ impl Recv {
         stream: &mut store::Ptr,
         counts: &mut Counts,
     ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
-        trace!("opening stream; init_window={}", self.init_window_sz);
-        let is_initial = stream.state.recv_open(frame.is_end_stream())?;
+        span!("opening_stream").enter(|| {
+            trace!(init_window = field::display(self.init_window_sz()));
 
-        if is_initial {
-            // TODO: be smarter about this logic
-            if frame.stream_id() > self.last_processed_id {
-                self.last_processed_id = frame.stream_id();
+            let is_initial = stream.state.recv_open(frame.is_end_stream())?;
+
+            if is_initial {
+                // TODO: be smarter about this logic
+                if frame.stream_id() > self.last_processed_id {
+                    self.last_processed_id = frame.stream_id();
+                }
+
+                // Increment the number of concurrent streams
+                counts.inc_num_recv_streams(stream);
             }
 
-            // Increment the number of concurrent streams
-            counts.inc_num_recv_streams(stream);
-        }
+            if !stream.content_length.is_head() {
+                use super::stream::ContentLength;
+                use http::header;
 
-        if !stream.content_length.is_head() {
-            use super::stream::ContentLength;
-            use http::header;
+                if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+                    let content_length = match parse_u64(content_length.as_bytes()) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err(RecvError::Stream {
+                                id: stream.id,
+                                reason: Reason::PROTOCOL_ERROR,
+                            }.into())
+                        },
+                    };
 
-            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
-                let content_length = match parse_u64(content_length.as_bytes()) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Err(RecvError::Stream {
-                            id: stream.id,
-                            reason: Reason::PROTOCOL_ERROR,
-                        }.into())
-                    },
+                    stream.content_length = ContentLength::Remaining(content_length);
+                }
+            }
+
+            if frame.is_over_size() {
+                // A frame is over size if the decoded header block was bigger than
+                // SETTINGS_MAX_HEADER_LIST_SIZE.
+                //
+                // > A server that receives a larger header block than it is willing
+                // > to handle can send an HTTP 431 (Request Header Fields Too
+                // > Large) status code [RFC6585]. A client can discard responses
+                // > that it cannot process.
+                //
+                // So, if peer is a server, we'll send a 431. In either case,
+                // an error is recorded, which will send a REFUSED_STREAM,
+                // since we don't want any of the data frames either.
+                trace!("frame for {:?} is over size", stream.id);
+                return if counts.peer().is_server() && is_initial {
+                    let mut res = frame::Headers::new(
+                        stream.id,
+                        frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                        HeaderMap::new()
+                    );
+                    res.set_end_stream();
+                    Err(RecvHeaderBlockError::Oversize(Some(res)))
+                } else {
+                    Err(RecvHeaderBlockError::Oversize(None))
                 };
-
-                stream.content_length = ContentLength::Remaining(content_length);
             }
-        }
 
-        if frame.is_over_size() {
-            // A frame is over size if the decoded header block was bigger than
-            // SETTINGS_MAX_HEADER_LIST_SIZE.
-            //
-            // > A server that receives a larger header block than it is willing
-            // > to handle can send an HTTP 431 (Request Header Fields Too
-            // > Large) status code [RFC6585]. A client can discard responses
-            // > that it cannot process.
-            //
-            // So, if peer is a server, we'll send a 431. In either case,
-            // an error is recorded, which will send a REFUSED_STREAM,
-            // since we don't want any of the data frames either.
-            trace!("recv_headers; frame for {:?} is over size", stream.id);
-            return if counts.peer().is_server() && is_initial {
-                let mut res = frame::Headers::new(
-                    stream.id,
-                    frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
-                    HeaderMap::new()
-                );
-                res.set_end_stream();
-                Err(RecvHeaderBlockError::Oversize(Some(res)))
-            } else {
-                Err(RecvHeaderBlockError::Oversize(None))
-            };
-        }
+            let stream_id = frame.stream_id();
+            let (pseudo, fields) = frame.into_parts();
+            let message = counts.peer().convert_poll_message(pseudo, fields, stream_id)?;
 
-        let stream_id = frame.stream_id();
-        let (pseudo, fields) = frame.into_parts();
-        let message = counts.peer().convert_poll_message(pseudo, fields, stream_id)?;
+            // Push the frame onto the stream's recv buffer
+            stream
+                .pending_recv
+                .push_back(&mut self.buffer, Event::Headers(message));
+            stream.notify_recv();
 
-        // Push the frame onto the stream's recv buffer
-        stream
-            .pending_recv
-            .push_back(&mut self.buffer, Event::Headers(message));
-        stream.notify_recv();
+            // Only servers can receive a headers frame that initiates the stream.
+            // This is verified in `Streams` before calling this function.
+            if counts.peer().is_server() {
+                self.pending_accept.push(stream);
+            }
 
-        // Only servers can receive a headers frame that initiates the stream.
-        // This is verified in `Streams` before calling this function.
-        if counts.peer().is_server() {
-            self.pending_accept.push(stream);
-        }
+            Ok(())
+        })
 
-        Ok(())
     }
 
     /// Called by the server to get the request
@@ -334,23 +340,24 @@ impl Recv {
         capacity: WindowSize,
         task: &mut Option<Task>,
     ) {
-        trace!(
-            "release_connection_capacity; size={}, connection in_flight_data={}",
-            capacity,
-            self.in_flight_data,
-        );
+        span!(
+            "release_connection_capacity",
+            capacity = field::display(capacity),
+            connection_in_flight_data = self.in_flight_data
+        ).enter(|| {
+            // Decrement in-flight data
+            self.in_flight_data -= capacity;
 
-        // Decrement in-flight data
-        self.in_flight_data -= capacity;
+            // Assign capacity to connection
+            self.flow.assign_capacity(capacity);
 
-        // Assign capacity to connection
-        self.flow.assign_capacity(capacity);
-
-        if self.flow.unclaimed_capacity().is_some() {
-            if let Some(task) = task.take() {
-                task.notify();
+            if self.flow.unclaimed_capacity().is_some() {
+                if let Some(task) = task.take() {
+                    task.notify();
+                }
             }
-        }
+        })
+
     }
 
     /// Releases capacity back to the connection & stream
@@ -360,31 +367,31 @@ impl Recv {
         stream: &mut store::Ptr,
         task: &mut Option<Task>,
     ) -> Result<(), UserError> {
-        trace!("release_capacity; size={}", capacity);
-
-        if capacity > stream.in_flight_recv_data {
-            return Err(UserError::ReleaseCapacityTooBig);
-        }
-
-        self.release_connection_capacity(capacity, task);
-
-        // Decrement in-flight data
-        stream.in_flight_recv_data -= capacity;
-
-        // Assign capacity to stream
-        stream.recv_flow.assign_capacity(capacity);
-
-
-        if stream.recv_flow.unclaimed_capacity().is_some() {
-            // Queue the stream for sending the WINDOW_UPDATE frame.
-            self.pending_window_updates.push(stream);
-
-            if let Some(task) = task.take() {
-                task.notify();
+        span!("release_capacity", size = field::display(capacity)).enter(|| {
+            if capacity > stream.in_flight_recv_data {
+                return Err(UserError::ReleaseCapacityTooBig);
             }
-        }
 
-        Ok(())
+            self.release_connection_capacity(capacity, task);
+
+            // Decrement in-flight data
+            stream.in_flight_recv_data -= capacity;
+
+            // Assign capacity to stream
+            stream.recv_flow.assign_capacity(capacity);
+
+
+            if stream.recv_flow.unclaimed_capacity().is_some() {
+                // Queue the stream for sending the WINDOW_UPDATE frame.
+                self.pending_window_updates.push(stream);
+
+                if let Some(task) = task.take() {
+                    task.notify();
+                }
+            }
+
+            Ok(())
+        })
     }
 
     /// Release any unclaimed capacity for a closed stream.

@@ -237,40 +237,40 @@ where
     ///
     /// If the stream is already contained by the list, return `false`.
     pub fn push(&mut self, stream: &mut store::Ptr) -> bool {
-        trace!("Queue::push");
+        span!("Queue::push").enter(|| {
+            if N::is_queued(stream) {
+                trace!(" -> already queued");
+                return false;
+            }
 
-        if N::is_queued(stream) {
-            trace!(" -> already queued");
-            return false;
-        }
+            N::set_queued(stream, true);
 
-        N::set_queued(stream, true);
+            // The next pointer shouldn't be set
+            debug_assert!(N::next(stream).is_none());
 
-        // The next pointer shouldn't be set
-        debug_assert!(N::next(stream).is_none());
+            // Queue the stream
+            match self.indices {
+                Some(ref mut idxs) => {
+                    trace!(" -> existing entries");
 
-        // Queue the stream
-        match self.indices {
-            Some(ref mut idxs) => {
-                trace!(" -> existing entries");
+                    // Update the current tail node to point to `stream`
+                    let key = stream.key();
+                    N::set_next(&mut stream.resolve(idxs.tail), Some(key));
 
-                // Update the current tail node to point to `stream`
-                let key = stream.key();
-                N::set_next(&mut stream.resolve(idxs.tail), Some(key));
+                    // Update the tail pointer
+                    idxs.tail = stream.key();
+                },
+                None => {
+                    trace!(" -> first entry");
+                    self.indices = Some(store::Indices {
+                        head: stream.key(),
+                        tail: stream.key(),
+                    });
+                },
+            }
 
-                // Update the tail pointer
-                idxs.tail = stream.key();
-            },
-            None => {
-                trace!(" -> first entry");
-                self.indices = Some(store::Indices {
-                    head: stream.key(),
-                    tail: stream.key(),
-                });
-            },
-        }
-
-        true
+            true
+        })
     }
 
     pub fn pop<'a, R>(&mut self, store: &'a mut R) -> Option<store::Ptr<'a>>
