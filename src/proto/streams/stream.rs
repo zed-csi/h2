@@ -3,6 +3,8 @@ use super::*;
 use std::time::Instant;
 use std::usize;
 
+use tokio_trace::field;
+
 /// Tracks Stream related state
 ///
 /// # Reference counting
@@ -137,54 +139,61 @@ impl Stream {
         init_send_window: WindowSize,
         init_recv_window: WindowSize,
     ) -> Stream {
-        let mut send_flow = FlowControl::new();
-        let mut recv_flow = FlowControl::new();
 
-        recv_flow
-            .inc_window(init_recv_window)
-            .ok()
-            .expect("invalid initial receive window");
-        recv_flow.assign_capacity(init_recv_window);
+        span!(
+            "Stream::new",
+            id = field::debug(&id),
+            init_send_window = field::display(&init_send_window),
+            init_recv_window = field::display(&init_recv_window),
+        ).enter(|| {
+            let mut send_flow = FlowControl::new();
+            let mut recv_flow = FlowControl::new();
+            recv_flow
+                .inc_window(init_recv_window)
+                .ok()
+                .expect("invalid initial receive window");
+            recv_flow.assign_capacity(init_recv_window);
 
-        send_flow
-            .inc_window(init_send_window)
-            .ok()
-            .expect("invalid initial send window size");
+            send_flow
+                .inc_window(init_send_window)
+                .ok()
+                .expect("invalid initial send window size");
 
-        Stream {
-            id,
-            state: State::default(),
-            ref_count: 0,
-            is_counted: false,
+            Stream {
+                id,
+                state: State::default(),
+                ref_count: 0,
+                is_counted: false,
 
-            // ===== Fields related to sending =====
-            next_pending_send: None,
-            is_pending_send: false,
-            send_flow: send_flow,
-            requested_send_capacity: 0,
-            buffered_send_data: 0,
-            send_task: None,
-            pending_send: buffer::Deque::new(),
-            is_pending_send_capacity: false,
-            next_pending_send_capacity: None,
-            send_capacity_inc: false,
-            is_pending_open: false,
-            next_open: None,
+                // ===== Fields related to sending =====
+                next_pending_send: None,
+                is_pending_send: false,
+                send_flow: send_flow,
+                requested_send_capacity: 0,
+                buffered_send_data: 0,
+                send_task: None,
+                pending_send: buffer::Deque::new(),
+                is_pending_send_capacity: false,
+                next_pending_send_capacity: None,
+                send_capacity_inc: false,
+                is_pending_open: false,
+                next_open: None,
 
-            // ===== Fields related to receiving =====
-            next_pending_accept: None,
-            is_pending_accept: false,
-            recv_flow: recv_flow,
-            in_flight_recv_data: 0,
-            next_window_update: None,
-            is_pending_window_update: false,
-            reset_at: None,
-            next_reset_expire: None,
-            pending_recv: buffer::Deque::new(),
-            recv_task: None,
-            pending_push_promises: store::Queue::new(),
-            content_length: ContentLength::Omitted,
-        }
+                // ===== Fields related to receiving =====
+                next_pending_accept: None,
+                is_pending_accept: false,
+                recv_flow: recv_flow,
+                in_flight_recv_data: 0,
+                next_window_update: None,
+                is_pending_window_update: false,
+                reset_at: None,
+                next_reset_expire: None,
+                pending_recv: buffer::Deque::new(),
+                recv_task: None,
+                pending_push_promises: store::Queue::new(),
+                content_length: ContentLength::Omitted,
+            }
+        })
     }
 
     /// Increment the stream's ref count
