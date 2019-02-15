@@ -367,7 +367,7 @@ where
     B: IntoBuf,
 {
     fn handshake2(io: T, builder: Builder) -> Handshake<T, B> {
-        let mut span = span!("server handshake");
+        let mut span = span!("server_handshake");
         let state = span.enter(|| {
             // Create the codec.
             let mut codec = Codec::new(io);
@@ -960,10 +960,12 @@ impl<B: IntoBuf> SendResponse<B> {
         response: Response<()>,
         end_of_stream: bool,
     ) -> Result<SendStream<B>, ::Error> {
-        self.inner
-            .send_response(response, end_of_stream)
-            .map(|_| SendStream::new(self.inner.clone()))
-            .map_err(Into::into)
+        span!("send_response", eos = end_of_stream).enter(|| {
+            self.inner
+                .send_response(response, end_of_stream)
+                .map(|_| SendStream::new(self.inner.clone()))
+                .map_err(Into::into)
+        })
     }
 
     /// Send a stream reset to the peer.
@@ -1140,19 +1142,27 @@ impl<T, B: IntoBuf> Future for Handshake<T, B>
             }
         });
         let server = poll?.map(|codec| {
-            let connection = proto::Connection::new(codec, Config {
-                next_stream_id: 2.into(),
-                // Server does not need to locally initiate any streams
-                initial_max_send_streams: 0,
-                reset_stream_duration: builder.reset_stream_duration,
-                reset_stream_max: builder.reset_stream_max,
-                settings: builder.settings.clone(),
+            let connection = span.enter(|| {
+                let conn = proto::Connection::new(codec, Config {
+                    next_stream_id: 2.into(),
+                    // Server does not need to locally initiate any streams
+                    initial_max_send_streams: 0,
+                    reset_stream_duration: builder.reset_stream_duration,
+                    reset_stream_max: builder.reset_stream_max,
+                    settings: builder.settings.clone(),
+                });
+                trace!("Handshake::poll(); connection established!");
+                conn
             });
 
-            trace!("Handshake::poll(); connection established!");
+            let conn_span = span!("server_conn");
+            if let Some(ref id) = span.id() {
+                conn_span.follows_from(id);
+            }
+
             let mut c = Connection {
                 connection,
-                span: span!("server connection"),
+                span: conn_span,
             };
             if let Some(sz) = builder.initial_target_connection_window_size {
                 c.set_target_window_size(sz);
