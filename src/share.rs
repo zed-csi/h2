@@ -8,6 +8,8 @@ use http::{HeaderMap};
 
 use std::fmt;
 
+use tokio_trace::field;
+
 /// Sends the body stream and trailers to the remote peer.
 ///
 /// # Overview
@@ -93,6 +95,7 @@ use std::fmt;
 /// [`send_reset`]: #method.send_reset
 #[derive(Debug)]
 pub struct SendStream<B: IntoBuf> {
+    span: tokio_trace::Span<'static>,
     inner: proto::StreamRef<B::Buf>,
 }
 
@@ -133,6 +136,7 @@ pub struct StreamId(u32);
 /// [`Stream`]: https://docs.rs/futures/0.1/futures/stream/trait.Stream.html
 #[must_use = "streams do nothing unless polled"]
 pub struct RecvStream {
+    span: tokio_trace::Span<'static>,
     inner: ReleaseCapacity,
 }
 
@@ -197,7 +201,11 @@ pub struct ReleaseCapacity {
 
 impl<B: IntoBuf> SendStream<B> {
     pub(crate) fn new(inner: proto::StreamRef<B::Buf>) -> Self {
-        SendStream { inner }
+        let span = span!("SendStream", stream = field::debug(inner.stream_id()));
+        SendStream {
+            span,
+            inner,
+        }
     }
 
     /// Requests capacity to send data.
@@ -262,8 +270,12 @@ impl<B: IntoBuf> SendStream<B> {
     /// See [Flow control](struct.SendStream.html#flow-control) for an overview
     /// of how send flow control works.
     pub fn reserve_capacity(&mut self, capacity: usize) {
-        // TODO: Check for overflow
-        self.inner.reserve_capacity(capacity as WindowSize)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            // TODO: Check for overflow
+            inner.reserve_capacity(capacity as WindowSize)
+        })
     }
 
     /// Returns the stream's current send capacity.
@@ -289,8 +301,13 @@ impl<B: IntoBuf> SendStream<B> {
     /// that `n` is lower than the previous call if, since then, the caller has
     /// sent data.
     pub fn poll_capacity(&mut self) -> Poll<Option<usize>, ::Error> {
-        let res = try_ready!(self.inner.poll_capacity());
-        Ok(Async::Ready(res.map(|v| v as usize)))
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            let res = try_ready!(inner.poll_capacity());
+            Ok(Async::Ready(res.map(|v| v as usize)))
+        })
+
     }
 
     /// Sends a single data frame to the remote peer.
@@ -309,9 +326,16 @@ impl<B: IntoBuf> SendStream<B> {
     ///
     /// [`Error`]: struct.Error.html
     pub fn send_data(&mut self, data: B, end_of_stream: bool) -> Result<(), ::Error> {
-        self.inner
-            .send_data(data.into_buf(), end_of_stream)
-            .map_err(Into::into)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            span!("send_data", eos = end_of_stream).enter(|| {
+                inner
+                    .send_data(data.into_buf(), end_of_stream)
+                    .map_err(Into::into)
+            })
+        })
+
     }
 
     /// Sends trailers to the remote peer.
@@ -319,7 +343,13 @@ impl<B: IntoBuf> SendStream<B> {
     /// Sending trailers implicitly closes the send stream. Once the send stream
     /// is closed, no more data can be sent.
     pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), ::Error> {
-        self.inner.send_trailers(trailers).map_err(Into::into)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            span!("send_trailers", trailers = field::debug(&trailers)).enter(|| {
+                inner.send_trailers(trailers).map_err(Into::into)
+            })
+        })
     }
 
     /// Resets the stream.
@@ -330,7 +360,13 @@ impl<B: IntoBuf> SendStream<B> {
     ///
     /// [`Error`]: struct.Error.html
     pub fn send_reset(&mut self, reason: Reason) {
-        self.inner.send_reset(reason)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            span!("send_reset").enter(|| {
+                inner.send_reset(reason)
+            })
+        })
     }
 
     /// Polls to be notified when the client resets this stream.
@@ -346,7 +382,11 @@ impl<B: IntoBuf> SendStream<B> {
     /// If connection sees an error, this returns that error instead of a
     /// `Reason`.
     pub fn poll_reset(&mut self) -> Poll<Reason, ::Error> {
-        self.inner.poll_reset(proto::PollReset::Streaming)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            inner.poll_reset(proto::PollReset::Streaming)
+        })
     }
 
     /// Returns the stream ID of this `SendStream`.
@@ -370,7 +410,11 @@ impl StreamId {
 
 impl RecvStream {
     pub(crate) fn new(inner: ReleaseCapacity) -> Self {
-        RecvStream { inner }
+        let span = span!("RecvStream", stream = field::debug(inner.stream_id()));
+        RecvStream {
+            inner,
+            span,
+        }
     }
 
     #[deprecated(since = "0.0.0")]
@@ -397,7 +441,11 @@ impl RecvStream {
 
     /// Returns received trailers.
     pub fn poll_trailers(&mut self) -> Poll<Option<HeaderMap>, ::Error> {
-        self.inner.inner.poll_trailers().map_err(Into::into)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            inner.inner.poll_trailers().map_err(Into::into)
+        })
     }
 
     /// Returns the stream ID of this stream.
@@ -415,7 +463,11 @@ impl futures::Stream for RecvStream {
     type Error = ::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.inner.inner.poll_data().map_err(Into::into)
+        let span = &mut self.span;
+        let inner = &mut self.inner;
+        span.enter(|| {
+            inner.inner.poll_data().map_err(Into::into)
+        })
     }
 }
 
