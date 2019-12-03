@@ -93,6 +93,7 @@ impl FlowControl {
         let available = self.available;
 
         if self.window_size >= available {
+            trace!("unclaimed_capacity; insufficient: available={} exceeds window={}", available, self.window_size);
             return None;
         }
 
@@ -100,8 +101,10 @@ impl FlowControl {
         let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
 
         if unclaimed < threshold {
+            trace!("unclaimed_capacity; insufficient: unclaimed={} does not meet threshold={}", unclaimed, threshold);
             None
         } else {
+            trace!("unclaimed_capacity; sufficient: unclaimed={} exceeds threshold={}", unclaimed, threshold);
             Some(unclaimed as WindowSize)
         }
     }
