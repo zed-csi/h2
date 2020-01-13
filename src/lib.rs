@@ -107,7 +107,7 @@ extern crate byteorder;
 extern crate slab;
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 extern crate string;
 extern crate indexmap;
 
