@@ -122,7 +122,7 @@ async fn run(script: &[u8]) -> Result<(), h2::Error> {
 }
 
 fn main() {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let mut rt = tokio::runtime::Runtime::new().unwrap();
     loop {
         honggfuzz::fuzz!(|data: &[u8]| {

@@ -13,7 +13,7 @@ const ALPN_H2: &str = "h2";
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
-    let _ = env_logger::try_init();
+    tracing_subscriber::fmt::init();
 
     let tls_client_config = std::sync::Arc::new({
         let mut c = rustls::ClientConfig::new();

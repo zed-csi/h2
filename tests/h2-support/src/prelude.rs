@@ -28,7 +28,7 @@ pub use super::assert::assert_frame_eq;
 
 // Re-export useful crates
 pub use tokio_test::io as mock_io;
-pub use {bytes, env_logger, futures, http, tokio::io as tokio_io};
+pub use {bytes, futures, http, tokio::io as tokio_io, tracing_subscriber};
 
 // Re-export primary future types
 pub use futures::{Future, Sink, Stream};
@@ -48,6 +48,8 @@ pub use bytes::{
 };
 
 pub use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use tracing_subscriber::prelude::*;
 
 pub use std::thread;
 pub use std::time::Duration;

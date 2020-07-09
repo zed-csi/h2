@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let _ = env_logger::try_init();
+    tracing_subscriber::fmt::init();
 
     let mut listener = TcpListener::bind("127.0.0.1:5928").await?;
 
