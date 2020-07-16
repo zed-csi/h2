@@ -11,8 +11,9 @@ use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
+use crate::mutex::Mutex;
 use crate::PollExt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{fmt, io};
 
 #[derive(Debug)]
@@ -1221,7 +1222,7 @@ impl OpaqueStreamRef {
 
 impl fmt::Debug for OpaqueStreamRef {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        use std::sync::TryLockError::*;
+        use crate::mutex::TryLockError::*;
 
         match self.inner.try_lock() {
             Ok(me) => {

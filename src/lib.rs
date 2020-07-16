@@ -104,6 +104,7 @@ macro_rules! ready {
 mod codec;
 mod error;
 mod hpack;
+pub(crate) mod mutex;
 mod proto;
 
 #[cfg(not(feature = "unstable"))]
