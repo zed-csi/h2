@@ -129,7 +129,11 @@ where
     /// Process inbound headers
     pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), RecvError> {
         let id = frame.stream_id();
+        let span = tracing::debug_span!("recv_headers", stream = ?id);
+        let _e = span.enter();
+        tracing::trace!("recv_headers");
         let mut me = self.inner.lock().unwrap();
+        tracing::trace!("locked");
         let me = &mut *me;
 
         // The GOAWAY process has begun. All streams with a greater ID than
