@@ -1,6 +1,7 @@
 use crate::codec::{SendError, UserError};
-use crate::proto;
+use crate::proto::{self, Initiator};
 
+use std::sync::Arc;
 use std::{error, fmt, io};
 
 pub use crate::frame::Reason;
@@ -22,19 +23,15 @@ pub struct Error {
 
 #[derive(Debug)]
 enum Kind {
-    /// An error caused by an action taken by the remote peer.
-    Remote(Reason),
-
-    /// An error caused by an invalid action taken by the peer
-    /// (i.e. a protocol error).
-    Local(Reason),
+    /// A protocol error.
+    Reset(Reason, Initiator),
 
     /// An error resulting from an invalid action taken by the user of this
     /// library.
     User(UserError),
 
     /// An `io::Error` occurred while trying to read or write.
-    Io(io::Error),
+    Io(Arc<io::Error>),
 }
 
 // ===== impl Error =====
@@ -46,7 +43,7 @@ impl Error {
     /// action taken by the peer (i.e. a protocol error).
     pub fn reason(&self) -> Option<Reason> {
         match self.kind {
-            Kind::Local(reason) | Kind::Remote(reason) => Some(reason),
+            Kind::Reset(reason, _) => Some(reason),
             _ => None,
         }
     }
@@ -67,17 +64,9 @@ impl Error {
         }
     }
 
-    /// Returns the error if the error is an io::Error
-    pub fn into_io(self) -> Option<io::Error> {
-        match self.kind {
-            Kind::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-
     pub(crate) fn from_io(err: io::Error) -> Self {
         Error {
-            kind: Kind::Io(err),
+            kind: Kind::Io(Arc::new(err)),
         }
     }
 }
@@ -88,18 +77,9 @@ impl From<proto::Error> for Error {
 
         Error {
             kind: match src {
-                Ours(reason) => Kind::Local(reason),
-                Theirs(reason) => Kind::Remote(reason),
+                Reset(reason, initiator) => Kind::Reset(reason, initiator),
                 Io(e) => Kind::Io(e),
             },
-        }
-    }
-}
-
-impl From<Reason> for Error {
-    fn from(src: Reason) -> Error {
-        Error {
-            kind: Kind::Local(src),
         }
     }
 }
@@ -124,8 +104,7 @@ impl From<UserError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self.kind {
-            Kind::Local(ref reason) => write!(fmt, "local error: {}", reason),
-            Kind::Remote(ref reason) => write!(fmt, "remote error: {}", reason),
+            Kind::Reset(ref reason, initiator) => write!(fmt, "{} error: {}", initiator, reason),
             Kind::User(ref e) => write!(fmt, "user error: {}", e),
             Kind::Io(ref e) => e.fmt(fmt),
         }

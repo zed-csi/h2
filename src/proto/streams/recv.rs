@@ -138,7 +138,7 @@ impl Recv {
         let next_id = self.next_stream_id()?;
         if id < next_id {
             proto_err!(conn: "id ({:?}) < next_id ({:?})", id, next_id);
-            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
         self.next_stream_id = id.next_id();
@@ -508,7 +508,7 @@ impl Recv {
                 stream
                     .recv_flow
                     .inc_window(inc)
-                    .map_err(proto::Error::Ours)?;
+                    .map_err(proto::Error::library_go_away)?;
                 stream.recv_flow.assign_capacity(inc);
                 Ok(())
             })
@@ -548,7 +548,7 @@ impl Recv {
             // Receiving a DATA frame when not expecting one is a protocol
             // error.
             proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
-            return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
         }
 
         tracing::trace!(
@@ -612,7 +612,7 @@ impl Recv {
 
             if stream.state.recv_close().is_err() {
                 proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
-                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
             }
         }
 
@@ -654,7 +654,7 @@ impl Recv {
                 self.flow.window_size(),
                 sz,
             );
-            return Err(Error::Ours(Reason::FLOW_CONTROL_ERROR));
+            return Err(Error::library_go_away(Reason::FLOW_CONTROL_ERROR));
         }
 
         // Update connection level flow control
@@ -791,7 +791,7 @@ impl Recv {
         if let Ok(id) = self.next_stream_id {
             Ok(id)
         } else {
-            Err(Error::Ours(Reason::PROTOCOL_ERROR))
+            Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
         }
     }
 
@@ -809,7 +809,7 @@ impl Recv {
     pub fn ensure_can_reserve(&self) -> Result<(), Error> {
         if !self.is_push_enabled {
             proto_err!(conn: "recv_push_promise: push is disabled");
-            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
         Ok(())

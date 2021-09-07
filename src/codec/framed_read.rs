@@ -110,7 +110,7 @@ fn decode_frame(
 
     if partial_inout.is_some() && head.kind() != Kind::Continuation {
         proto_err!(conn: "expected CONTINUATION, got {:?}", head.kind());
-        return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+        return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
     }
 
     let kind = head.kind();
@@ -138,7 +138,7 @@ fn decode_frame(
                 },
                 Err(e) => {
                     proto_err!(conn: "failed to load frame; err={:?}", e);
-                    return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
                 }
             };
 
@@ -158,7 +158,7 @@ fn decode_frame(
                 },
                 Err(e) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
                 }
             }
 
@@ -183,7 +183,7 @@ fn decode_frame(
 
             res.map_err(|e| {
                 proto_err!(conn: "failed to load SETTINGS frame; err={:?}", e);
-                Error::Ours(Reason::PROTOCOL_ERROR)
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
@@ -192,7 +192,7 @@ fn decode_frame(
 
             res.map_err(|e| {
                 proto_err!(conn: "failed to load PING frame; err={:?}", e);
-                Error::Ours(Reason::PROTOCOL_ERROR)
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
@@ -201,7 +201,7 @@ fn decode_frame(
 
             res.map_err(|e| {
                 proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", e);
-                Error::Ours(Reason::PROTOCOL_ERROR)
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
@@ -212,7 +212,7 @@ fn decode_frame(
             // TODO: Should this always be connection level? Probably not...
             res.map_err(|e| {
                 proto_err!(conn: "failed to load DATA frame; err={:?}", e);
-                Error::Ours(Reason::PROTOCOL_ERROR)
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
@@ -221,7 +221,7 @@ fn decode_frame(
             let res = frame::Reset::load(head, &bytes[frame::HEADER_LEN..]);
             res.map_err(|e| {
                 proto_err!(conn: "failed to load RESET frame; err={:?}", e);
-                Error::Ours(Reason::PROTOCOL_ERROR)
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
@@ -229,7 +229,7 @@ fn decode_frame(
             let res = frame::GoAway::load(&bytes[frame::HEADER_LEN..]);
             res.map_err(|e| {
                 proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
-                Error::Ours(Reason::PROTOCOL_ERROR)
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
@@ -238,7 +238,7 @@ fn decode_frame(
             if head.stream_id() == 0 {
                 // Invalid stream identifier
                 proto_err!(conn: "invalid stream ID 0");
-                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
             }
 
             match frame::Priority::load(head, &bytes[frame::HEADER_LEN..]) {
@@ -256,7 +256,7 @@ fn decode_frame(
                 }
                 Err(e) => {
                     proto_err!(conn: "failed to load PRIORITY frame; err={:?};", e);
-                    return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
                 }
             }
         }
@@ -267,14 +267,14 @@ fn decode_frame(
                 Some(partial) => partial,
                 None => {
                     proto_err!(conn: "received unexpected CONTINUATION frame");
-                    return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
                 }
             };
 
             // The stream identifiers must match
             if partial.frame.stream_id() != head.stream_id() {
                 proto_err!(conn: "CONTINUATION frame stream ID does not match previous frame stream ID");
-                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
             }
 
             // Extend the buf
@@ -297,7 +297,7 @@ fn decode_frame(
                     // the attacker to go away.
                     if partial.buf.len() + bytes.len() > max_header_list_size {
                         proto_err!(conn: "CONTINUATION frame header block size over ignorable limit");
-                        return Err(Error::Ours(Reason::COMPRESSION_ERROR).into());
+                        return Err(Error::library_go_away(Reason::COMPRESSION_ERROR).into());
                     }
                 }
                 partial.buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);
@@ -319,7 +319,7 @@ fn decode_frame(
                 }
                 Err(e) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
                 }
             }
 
@@ -375,7 +375,7 @@ fn map_err(err: io::Error) -> RecvError {
     if let io::ErrorKind::InvalidData = err.kind() {
         if let Some(custom) = err.get_ref() {
             if custom.is::<LengthDelimitedCodecError>() {
-                return Error::Ours(Reason::FRAME_SIZE_ERROR).into();
+                return Error::library_go_away(Reason::FRAME_SIZE_ERROR).into();
             }
         }
     }

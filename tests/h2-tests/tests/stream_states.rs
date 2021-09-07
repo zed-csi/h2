@@ -207,13 +207,13 @@ async fn errors_if_recv_frame_exceeds_max_frame_size() {
             let body = resp.into_parts().1;
             let res = util::concat(body).await;
             let err = res.unwrap_err();
-            assert_eq!(err.to_string(), "local error: frame with invalid size");
+            assert_eq!(err.to_string(), "library error: frame with invalid size");
         };
 
         // client should see a conn error
         let conn = async move {
             let err = h2.await.unwrap_err();
-            assert_eq!(err.to_string(), "local error: frame with invalid size");
+            assert_eq!(err.to_string(), "remote error: frame with invalid size");
         };
         join(conn, req).await;
     };

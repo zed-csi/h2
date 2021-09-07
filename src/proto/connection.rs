@@ -88,10 +88,10 @@ enum State {
     Open,
 
     /// The codec must be flushed
-    Closing(Reason),
+    Closing(Reason, Initiator),
 
     /// In a closed state
-    Closed(Reason),
+    Closed(Reason, Initiator),
 }
 
 impl<T, P, B> Connection<T, P, B>
@@ -191,7 +191,7 @@ where
         self.inner.as_dyn().go_away_from_user(e)
     }
 
-    fn take_error(&mut self, ours: Reason) -> Result<(), Error> {
+    fn take_error(&mut self, ours: Reason, initiator: Initiator) -> Result<(), Error> {
         let theirs = self
             .inner
             .error
@@ -200,9 +200,9 @@ where
             .map_or(Reason::NO_ERROR, frame::GoAway::reason);
 
         match (ours, theirs) {
-            (Reason::NO_ERROR, Reason::NO_ERROR) => Ok(()),
-            (ours, Reason::NO_ERROR) => Err(Error::Ours(ours)),
-            (_, theirs) => Err(Error::Theirs(theirs)),
+            (Reason::NO_ERROR, Reason::NO_ERROR) => return Ok(()),
+            (ours, Reason::NO_ERROR) => Err(Error::Reset(ours, initiator)),
+            (_, theirs) => Err(Error::Reset(theirs, Initiator::Remote)),
         }
     }
 
@@ -260,15 +260,17 @@ where
 
                     self.inner.as_dyn().handle_poll2_result(result)?
                 }
-                State::Closing(reason) => {
+                State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
                     // Flush/shutdown the codec
                     ready!(self.codec.shutdown(cx))?;
 
                     // Transition the state to error
-                    self.inner.state = State::Closed(reason);
+                    self.inner.state = State::Closed(reason, initiator);
                 }
-                State::Closed(reason) => return Poll::Ready(self.take_error(reason)),
+                State::Closed(reason, initiator) => {
+                    return Poll::Ready(self.take_error(reason, initiator));
+                }
             }
         }
     }
@@ -292,7 +294,7 @@ where
                         // the same error back to the user.
                         return Poll::Ready(Ok(()));
                     } else {
-                        return Poll::Ready(Err(RecvError::Connection(Error::Theirs(reason))));
+                        return Poll::Ready(Err(Error::remote_go_away(reason).into()));
                     }
                 }
                 // Only NO_ERROR should be waiting for idle
@@ -376,24 +378,35 @@ where
         self.go_away.go_away_from_user(frame);
 
         // Notify all streams of reason we're abruptly closing.
-        self.streams.handle_error(&Error::Ours(e));
+        self.streams.handle_error(Error::user_go_away(e));
     }
 
     fn handle_poll2_result(&mut self, result: Result<(), RecvError>) -> Result<(), Error> {
         match result {
             // The connection has shutdown normally
             Ok(()) => {
-                *self.state = State::Closing(Reason::NO_ERROR);
+                *self.state = State::Closing(Reason::NO_ERROR, Initiator::Library);
                 Ok(())
             }
             // Attempting to read a frame resulted in a connection level
             // error. This is handled by setting a GOAWAY frame followed by
             // terminating the connection.
-            Err(RecvError::Connection(Error::Ours(e))) => {
-                Ok(self.handle_error_with_reason(e, Error::Ours))
-            }
-            Err(RecvError::Connection(Error::Theirs(e))) => {
-                Ok(self.handle_error_with_reason(e, Error::Theirs))
+            Err(RecvError::Connection(Error::Reset(reason, initiator))) => {
+                let e = Error::Reset(reason, initiator);
+                tracing::debug!(error = ?e, "Connection::poll; connection error");
+
+                // We may have already sent a GOAWAY for this error,
+                // if so, don't send another, just flush and close up.
+                if self.go_away.going_away_reason() == Some(reason) {
+                    tracing::trace!("    -> already going away");
+                    *self.state = State::Closing(reason, initiator);
+                    return Ok(());
+                }
+
+                // Reset all active streams
+                self.streams.handle_error(e);
+                self.go_away_now(reason);
+                Ok(())
             }
             // Attempting to read a frame resulted in a stream level error.
             // This is handled by resetting the frame then trying to read
@@ -409,35 +422,15 @@ where
             // TODO: Are I/O errors recoverable?
             Err(RecvError::Connection(Error::Io(e))) => {
                 tracing::debug!(error = ?e, "Connection::poll; IO error");
-                let e = e.into();
+                let e = Error::Io(e);
 
                 // Reset all active streams
-                self.streams.handle_error(&e);
+                self.streams.handle_error(e.clone());
 
                 // Return the error
                 Err(e)
             }
         }
-    }
-
-    fn handle_error_with_reason<F>(&mut self, reason: Reason, ctor: F)
-    where
-        F: FnOnce(Reason) -> Error,
-    {
-        let e = ctor(reason);
-        tracing::debug!(error = ?e, "Connection::poll; connection error");
-
-        // We may have already sent a GOAWAY for this error,
-        // if so, don't send another, just flush and close up.
-        if self.go_away.going_away_reason() == Some(reason) {
-            tracing::trace!("    -> already going away");
-            *self.state = State::Closing(reason);
-            return;
-        }
-
-        // Reset all active streams
-        self.streams.handle_error(&e);
-        self.go_away_now(reason);
     }
 
     fn recv_frame(&mut self, frame: Option<Frame>) -> Result<ReceivedFrame, RecvError> {

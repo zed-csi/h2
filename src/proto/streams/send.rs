@@ -4,7 +4,7 @@ use super::{
 };
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
-use crate::proto::Error;
+use crate::proto::{Error, Initiator};
 
 use bytes::Buf;
 use http;
@@ -166,6 +166,7 @@ impl Send {
     pub fn send_reset<B>(
         &mut self,
         reason: Reason,
+        initiator: Initiator,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
@@ -176,11 +177,12 @@ impl Send {
         let is_empty = stream.pending_send.is_empty();
 
         tracing::trace!(
-            "send_reset(..., reason={:?}, stream={:?}, ..., \
+            "send_reset(..., reason={:?}, initiator={:?}, stream={:?}, ..., \
              is_reset={:?}; is_closed={:?}; pending_send.is_empty={:?}; \
              state={:?} \
              ",
             reason,
+            initiator,
             stream.id,
             is_reset,
             is_closed,
@@ -198,7 +200,7 @@ impl Send {
         }
 
         // Transition the state to reset no matter what.
-        stream.state.set_reset(reason);
+        stream.state.set_reset(reason, initiator);
 
         // If closed AND the send queue is flushed, then the stream cannot be
         // reset explicitly, either. Implicit resets can still be queued.
@@ -380,7 +382,14 @@ impl Send {
         if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
             tracing::debug!("recv_stream_window_update !!; err={:?}", e);
 
-            self.send_reset(Reason::FLOW_CONTROL_ERROR, buffer, stream, counts, task);
+            self.send_reset(
+                Reason::FLOW_CONTROL_ERROR,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                task,
+            );
 
             return Err(e);
         }
@@ -401,7 +410,7 @@ impl Send {
                 "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
                 last_stream_id, self.max_stream_id,
             );
-            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
         self.max_stream_id = last_stream_id;
@@ -499,7 +508,7 @@ impl Send {
 
                 store.for_each(|mut stream| {
                     self.recv_stream_window_update(inc, buffer, &mut stream, counts, task)
-                        .map_err(Error::Ours)
+                        .map_err(Error::library_go_away)
                 })?;
             }
         }

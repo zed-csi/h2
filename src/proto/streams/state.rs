@@ -2,7 +2,7 @@ use std::io;
 
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
-use crate::proto::{self, Error, PollReset};
+use crate::proto::{self, Error, Initiator, PollReset};
 
 use self::Inner::*;
 use self::Peer::*;
@@ -52,7 +52,7 @@ pub struct State {
     inner: Inner,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Inner {
     Idle,
     // TODO: these states shouldn't count against concurrency limits:
@@ -70,12 +70,10 @@ enum Peer {
     Streaming,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 enum Cause {
     EndStream,
-    RemotelyReset(Reason),
-    LocallyReset(Reason),
-    Io,
+    Error(Error),
 
     /// This indicates to the connection that a reset frame must be sent out
     /// once the send queue has been flushed.
@@ -84,7 +82,7 @@ enum Cause {
     /// - User drops all references to a stream, so we want to CANCEL the it.
     /// - Header block size was too large, so we want to REFUSE, possibly
     ///   after sending a 431 response frame.
-    Scheduled(Reason),
+    ScheduledLibraryReset(Reason),
 }
 
 impl State {
@@ -194,10 +192,10 @@ impl State {
                     HalfClosedLocal(Streaming)
                 }
             }
-            state => {
+            ref state => {
                 // All other transitions result in a protocol error
                 proto_err!(conn: "recv_open: in unexpected state {:?}", state);
-                return Err(Error::Ours(Reason::PROTOCOL_ERROR));
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
         };
 
@@ -211,9 +209,9 @@ impl State {
                 self.inner = ReservedRemote;
                 Ok(())
             }
-            state => {
+            ref state => {
                 proto_err!(conn: "reserve_remote: in unexpected state {:?}", state);
-                Err(Error::Ours(Reason::PROTOCOL_ERROR))
+                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
             }
         }
     }
@@ -243,9 +241,9 @@ impl State {
                 self.inner = Closed(Cause::EndStream);
                 Ok(())
             }
-            state => {
+            ref state => {
                 proto_err!(conn: "recv_close: in unexpected state {:?}", state);
-                Err(Error::Ours(Reason::PROTOCOL_ERROR))
+                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
             }
         }
     }
@@ -274,14 +272,14 @@ impl State {
             // In either of these cases, we want to overwrite the stream's
             // previous state with the received RST_STREAM, so that the queue
             // will be cleared by `Prioritize::pop_frame`.
-            state => {
+            ref state => {
                 tracing::trace!(
                     "recv_reset; frame={:?}; state={:?}; queued={:?}",
                     frame,
                     state,
                     queued
                 );
-                self.inner = Closed(Cause::RemotelyReset(frame.reason()));
+                self.inner = Closed(Cause::Error(Error::remote_go_away(frame.reason())));
             }
         }
     }
@@ -292,11 +290,7 @@ impl State {
             Closed(..) => {}
             _ => {
                 tracing::trace!("handle_error; err={:?}", err);
-                self.inner = Closed(match *err {
-                    Error::Ours(reason) => Cause::LocallyReset(reason),
-                    Error::Theirs(reason) => Cause::RemotelyReset(reason),
-                    Error::Io(..) => Cause::Io,
-                });
+                self.inner = Closed(Cause::Error(err.clone()));
             }
         }
     }
@@ -304,9 +298,9 @@ impl State {
     pub fn recv_eof(&mut self) {
         match self.inner {
             Closed(..) => {}
-            s => {
-                tracing::trace!("recv_eof; state={:?}", s);
-                self.inner = Closed(Cause::Io);
+            ref state => {
+                tracing::trace!("recv_eof; state={:?}", state);
+                self.inner = Closed(Cause::Error(io::ErrorKind::BrokenPipe.into()));
             }
         }
     }
@@ -323,39 +317,39 @@ impl State {
                 tracing::trace!("send_close: HalfClosedRemote => Closed");
                 self.inner = Closed(Cause::EndStream);
             }
-            state => panic!("send_close: unexpected state {:?}", state),
+            ref state => panic!("send_close: unexpected state {:?}", state),
         }
     }
 
     /// Set the stream state to reset locally.
-    pub fn set_reset(&mut self, reason: Reason) {
-        self.inner = Closed(Cause::LocallyReset(reason));
+    pub fn set_reset(&mut self, reason: Reason, initiator: Initiator) {
+        self.inner = Closed(Cause::Error(Error::Reset(reason, initiator)));
     }
 
     /// Set the stream state to a scheduled reset.
     pub fn set_scheduled_reset(&mut self, reason: Reason) {
         debug_assert!(!self.is_closed());
-        self.inner = Closed(Cause::Scheduled(reason));
+        self.inner = Closed(Cause::ScheduledLibraryReset(reason));
     }
 
     pub fn get_scheduled_reset(&self) -> Option<Reason> {
         match self.inner {
-            Closed(Cause::Scheduled(reason)) => Some(reason),
+            Closed(Cause::ScheduledLibraryReset(reason)) => Some(reason),
             _ => None,
         }
     }
 
     pub fn is_scheduled_reset(&self) -> bool {
         match self.inner {
-            Closed(Cause::Scheduled(..)) => true,
+            Closed(Cause::ScheduledLibraryReset(..)) => true,
             _ => false,
         }
     }
 
     pub fn is_local_reset(&self) -> bool {
         match self.inner {
-            Closed(Cause::LocallyReset(_)) => true,
-            Closed(Cause::Scheduled(..)) => true,
+            Closed(Cause::Error(ref e)) => e.is_local(),
+            Closed(Cause::ScheduledLibraryReset(..)) => true,
             _ => false,
         }
     }
@@ -434,11 +428,10 @@ impl State {
     pub fn ensure_recv_open(&self) -> Result<bool, proto::Error> {
         // TODO: Is this correct?
         match self.inner {
-            Closed(Cause::RemotelyReset(reason)) => Err(proto::Error::Theirs(reason)),
-            Closed(Cause::LocallyReset(reason)) | Closed(Cause::Scheduled(reason)) => {
-                Err(proto::Error::Ours(reason))
+            Closed(Cause::Error(ref e)) => Err(e.clone()),
+            Closed(Cause::ScheduledLibraryReset(reason)) => {
+                Err(proto::Error::library_go_away(reason))
             }
-            Closed(Cause::Io) => Err(proto::Error::Io(io::ErrorKind::BrokenPipe.into())),
             Closed(Cause::EndStream) | HalfClosedRemote(..) | ReservedLocal => Ok(false),
             _ => Ok(true),
         }
@@ -447,10 +440,9 @@ impl State {
     /// Returns a reason if the stream has been reset.
     pub(super) fn ensure_reason(&self, mode: PollReset) -> Result<Option<Reason>, crate::Error> {
         match self.inner {
-            Closed(Cause::RemotelyReset(reason))
-            | Closed(Cause::LocallyReset(reason))
-            | Closed(Cause::Scheduled(reason)) => Ok(Some(reason)),
-            Closed(Cause::Io) => Err(proto::Error::Io(io::ErrorKind::BrokenPipe.into()).into()),
+            Closed(Cause::Error(Error::Reset(reason, _)))
+            | Closed(Cause::ScheduledLibraryReset(reason)) => Ok(Some(reason)),
+            Closed(Cause::Error(ref e)) => Err(e.clone().into()),
             Open {
                 local: Streaming, ..
             }

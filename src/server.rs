@@ -1202,7 +1202,7 @@ where
             if &PREFACE[self.pos..self.pos + n] != buf.filled() {
                 proto_err!(conn: "read_preface: invalid preface");
                 // TODO: Should this just write the GO_AWAY frame directly?
-                return Poll::Ready(Err(Reason::PROTOCOL_ERROR.into()));
+                return Poll::Ready(Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into()));
             }
 
             self.pos += n;
@@ -1416,7 +1416,7 @@ impl proto::Peer for Peer {
         // Specifying :status for a request is a protocol error
         if pseudo.status.is_some() {
             tracing::trace!("malformed headers: :status field on request; PROTOCOL_ERROR");
-            return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
         }
 
         // Convert the URI

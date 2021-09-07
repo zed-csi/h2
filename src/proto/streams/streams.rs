@@ -3,7 +3,7 @@ use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, RecvError, SendError, UserError};
 use crate::frame::{self, Frame, Reason};
-use crate::proto::{peer, Error, Open, Peer, WindowSize};
+use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
 
 use bytes::{Buf, Bytes};
@@ -315,7 +315,7 @@ impl<B> DynStreams<'_, B> {
     }
 
     /// Notify all streams that a connection-level error happened.
-    pub fn handle_error(&mut self, err: &proto::Error) -> StreamId {
+    pub fn handle_error(&mut self, err: proto::Error) -> StreamId {
         let mut me = self.inner.lock().unwrap();
         me.handle_error(&self.send_buffer, err)
     }
@@ -536,7 +536,7 @@ impl Inner {
                 }
 
                 proto_err!(conn: "recv_data: stream not found; id={:?}", id);
-                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
             }
         };
 
@@ -569,7 +569,7 @@ impl Inner {
 
         if id.is_zero() {
             proto_err!(conn: "recv_reset: invalid stream ID 0");
-            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
         // The GOAWAY process has begun. All streams with a greater ID than
@@ -589,7 +589,7 @@ impl Inner {
                 // TODO: Are there other error cases?
                 self.actions
                     .ensure_not_idle(self.counts.peer(), id)
-                    .map_err(Error::Ours)?;
+                    .map_err(Error::library_go_away)?;
 
                 return Ok(());
             }
@@ -622,7 +622,7 @@ impl Inner {
             self.actions
                 .send
                 .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
-                .map_err(Error::Ours)?;
+                .map_err(Error::library_go_away)?;
         } else {
             // The remote may send window updates for streams that the local now
             // considers closed. It's ok...
@@ -640,14 +640,14 @@ impl Inner {
             } else {
                 self.actions
                     .ensure_not_idle(self.counts.peer(), id)
-                    .map_err(Error::Ours)?;
+                    .map_err(Error::library_go_away)?;
             }
         }
 
         Ok(())
     }
 
-    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: &proto::Error) -> StreamId {
+    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: proto::Error) -> StreamId {
         let actions = &mut self.actions;
         let counts = &mut self.counts;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
@@ -658,14 +658,14 @@ impl Inner {
         self.store
             .for_each(|stream| {
                 counts.transition(stream, |counts, stream| {
-                    actions.recv.handle_error(err, &mut *stream);
+                    actions.recv.handle_error(&err, &mut *stream);
                     actions.send.handle_error(send_buffer, stream, counts);
                     Ok::<_, ()>(())
                 })
             })
             .unwrap();
 
-        actions.conn_error = Some(err.shallow_clone());
+        actions.conn_error = Some(err);
 
         last_processed_id
     }
@@ -684,7 +684,7 @@ impl Inner {
 
         actions.send.recv_go_away(last_stream_id)?;
 
-        let err = Error::Theirs(frame.reason());
+        let err = Error::remote_go_away(frame.reason());
 
         self.store
             .for_each(|stream| {
@@ -733,7 +733,7 @@ impl Inner {
             }
             None => {
                 proto_err!(conn: "recv_push_promise: initiating stream is in an invalid state");
-                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
             }
         };
 
@@ -886,8 +886,13 @@ impl Inner {
         let stream = self.store.resolve(key);
         let mut send_buffer = send_buffer.inner.lock().unwrap();
         let send_buffer = &mut *send_buffer;
-        self.actions
-            .send_reset(stream, reason, &mut self.counts, send_buffer);
+        self.actions.send_reset(
+            stream,
+            reason,
+            Initiator::Library,
+            &mut self.counts,
+            send_buffer,
+        );
     }
 }
 
@@ -1060,7 +1065,7 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.actions
-            .send_reset(stream, reason, &mut me.counts, send_buffer);
+            .send_reset(stream, reason, Initiator::User, &mut me.counts, send_buffer);
     }
 
     pub fn send_response(
@@ -1468,12 +1473,19 @@ impl Actions {
         &mut self,
         stream: store::Ptr,
         reason: Reason,
+        initiator: Initiator,
         counts: &mut Counts,
         send_buffer: &mut Buffer<Frame<B>>,
     ) {
         counts.transition(stream, |counts, stream| {
-            self.send
-                .send_reset(reason, send_buffer, stream, counts, &mut self.task);
+            self.send.send_reset(
+                reason,
+                initiator,
+                send_buffer,
+                stream,
+                counts,
+                &mut self.task,
+            );
             self.recv.enqueue_reset_expiration(stream, counts);
             // if a RecvStream is parked, ensure it's notified
             stream.notify_recv();
@@ -1489,8 +1501,14 @@ impl Actions {
     ) -> Result<(), RecvError> {
         if let Err(RecvError::Stream { reason, .. }) = res {
             // Reset the stream.
-            self.send
-                .send_reset(reason, buffer, stream, counts, &mut self.task);
+            self.send.send_reset(
+                reason,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                &mut self.task,
+            );
             Ok(())
         } else {
             res
@@ -1507,7 +1525,7 @@ impl Actions {
 
     fn ensure_no_conn_error(&self) -> Result<(), proto::Error> {
         if let Some(ref err) = self.conn_error {
-            Err(err.shallow_clone())
+            Err(err.clone())
         } else {
             Ok(())
         }

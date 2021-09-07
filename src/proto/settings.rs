@@ -68,7 +68,7 @@ impl Settings {
                     // We haven't sent any SETTINGS frames to be ACKed, so
                     // this is very bizarre! Remote is either buggy or malicious.
                     proto_err!(conn: "received unexpected settings ack");
-                    Err(Error::Ours(Reason::PROTOCOL_ERROR))
+                    Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
                 }
             }
         } else {
