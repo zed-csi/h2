@@ -1,4 +1,3 @@
-use crate::codec::RecvError;
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -99,7 +98,7 @@ fn decode_frame(
     max_header_list_size: usize,
     partial_inout: &mut Option<Partial>,
     mut bytes: BytesMut,
-) -> Result<Option<Frame>, RecvError> {
+) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
     let _e = span.enter();
 
@@ -131,14 +130,11 @@ fn decode_frame(
                     // A stream cannot depend on itself. An endpoint MUST
                     // treat this as a stream error (Section 5.4.2) of type
                     // `PROTOCOL_ERROR`.
-                    return Err(RecvError::Stream {
-                        id: $head.stream_id(),
-                        reason: Reason::PROTOCOL_ERROR,
-                    });
+                    return Err(Error::library_reset($head.stream_id(), Reason::PROTOCOL_ERROR));
                 },
                 Err(e) => {
                     proto_err!(conn: "failed to load frame; err={:?}", e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             };
 
@@ -151,14 +147,11 @@ fn decode_frame(
                 Err(frame::Error::MalformedMessage) => {
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
-                    return Err(RecvError::Stream {
-                        id,
-                        reason: Reason::PROTOCOL_ERROR,
-                    });
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
                 },
                 Err(e) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             }
 
@@ -249,14 +242,11 @@ fn decode_frame(
                     // `PROTOCOL_ERROR`.
                     let id = head.stream_id();
                     proto_err!(stream: "PRIORITY invalid dependency ID; stream={:?}", id);
-                    return Err(RecvError::Stream {
-                        id,
-                        reason: Reason::PROTOCOL_ERROR,
-                    });
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
                 }
                 Err(e) => {
                     proto_err!(conn: "failed to load PRIORITY frame; err={:?};", e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             }
         }
@@ -312,14 +302,11 @@ fn decode_frame(
                 Err(frame::Error::MalformedMessage) => {
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
-                    return Err(RecvError::Stream {
-                        id,
-                        reason: Reason::PROTOCOL_ERROR,
-                    });
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
                 }
                 Err(e) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             }
 
@@ -343,7 +330,7 @@ impl<T> Stream for FramedRead<T>
 where
     T: AsyncRead + Unpin,
 {
-    type Item = Result<Frame, RecvError>;
+    type Item = Result<Frame, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let span = tracing::trace_span!("FramedRead::poll_next");
@@ -371,11 +358,11 @@ where
     }
 }
 
-fn map_err(err: io::Error) -> RecvError {
+fn map_err(err: io::Error) -> Error {
     if let io::ErrorKind::InvalidData = err.kind() {
         if let Some(custom) = err.get_ref() {
             if custom.is::<LengthDelimitedCodecError>() {
-                return Error::library_go_away(Reason::FRAME_SIZE_ERROR).into();
+                return Error::library_go_away(Reason::FRAME_SIZE_ERROR);
             }
         }
     }

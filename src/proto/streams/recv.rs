@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::{RecvError, UserError};
+use crate::codec::UserError;
 use crate::frame::{self, PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto::{self, Error};
 use std::task::Context;
@@ -68,7 +68,7 @@ pub(super) enum Event {
 #[derive(Debug)]
 pub(super) enum RecvHeaderBlockError<T> {
     Oversize(T),
-    State(RecvError),
+    State(Error),
 }
 
 #[derive(Debug)]
@@ -182,11 +182,7 @@ impl Recv {
                     Ok(v) => v,
                     Err(()) => {
                         proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
-                        return Err(RecvError::Stream {
-                            id: stream.id,
-                            reason: Reason::PROTOCOL_ERROR,
-                        }
-                        .into());
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
                     }
                 };
 
@@ -318,16 +314,13 @@ impl Recv {
         &mut self,
         frame: frame::Headers,
         stream: &mut store::Ptr,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         // Transition the state
         stream.state.recv_close()?;
 
         if stream.ensure_content_length_zero().is_err() {
             proto_err!(stream: "recv_trailers: content-length is not zero; stream={:?};",  stream.id);
-            return Err(RecvError::Stream {
-                id: stream.id,
-                reason: Reason::PROTOCOL_ERROR,
-            });
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
         let trailers = frame.into_fields();
@@ -526,11 +519,7 @@ impl Recv {
         stream.pending_recv.is_empty()
     }
 
-    pub fn recv_data(
-        &mut self,
-        frame: frame::Data,
-        stream: &mut store::Ptr,
-    ) -> Result<(), RecvError> {
+    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
         let sz = frame.payload().len();
 
         // This should have been enforced at the codec::FramedRead layer, so
@@ -548,7 +537,7 @@ impl Recv {
             // Receiving a DATA frame when not expecting one is a protocol
             // error.
             proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
-            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
         tracing::trace!(
@@ -579,10 +568,7 @@ impl Recv {
             // So, for violating the **stream** window, we can send either a
             // stream or connection error. We've opted to send a stream
             // error.
-            return Err(RecvError::Stream {
-                id: stream.id,
-                reason: Reason::FLOW_CONTROL_ERROR,
-            });
+            return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
         }
 
         if stream.dec_content_length(frame.payload().len()).is_err() {
@@ -591,10 +577,7 @@ impl Recv {
                 stream.id,
                 frame.payload().len(),
             );
-            return Err(RecvError::Stream {
-                id: stream.id,
-                reason: Reason::PROTOCOL_ERROR,
-            });
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
         if frame.is_end_stream() {
@@ -604,10 +587,7 @@ impl Recv {
                     stream.id,
                     frame.payload().len(),
                 );
-                return Err(RecvError::Stream {
-                    id: stream.id,
-                    reason: Reason::PROTOCOL_ERROR,
-                });
+                return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
             }
 
             if stream.state.recv_close().is_err() {
@@ -669,7 +649,7 @@ impl Recv {
         &mut self,
         frame: frame::PushPromise,
         stream: &mut store::Ptr,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         stream.state.reserve_remote()?;
         if frame.is_over_size() {
             // A frame is over size if the decoded header block was bigger than
@@ -688,10 +668,10 @@ impl Recv {
                  headers frame is over size; promised_id={:?};",
                 frame.promised_id(),
             );
-            return Err(RecvError::Stream {
-                id: frame.promised_id(),
-                reason: Reason::REFUSED_STREAM,
-            });
+            return Err(Error::library_reset(
+                frame.promised_id(),
+                Reason::REFUSED_STREAM,
+            ));
         }
 
         let promised_id = frame.promised_id();
@@ -714,10 +694,7 @@ impl Recv {
                     promised_id,
                 ),
             }
-            return Err(RecvError::Stream {
-                id: promised_id,
-                reason: Reason::PROTOCOL_ERROR,
-            });
+            return Err(Error::library_reset(promised_id, Reason::PROTOCOL_ERROR));
         }
 
         use super::peer::PollMessage::*;
@@ -1096,14 +1073,8 @@ impl Open {
 
 // ===== impl RecvHeaderBlockError =====
 
-impl<T> From<RecvError> for RecvHeaderBlockError<T> {
-    fn from(err: RecvError) -> Self {
-        RecvHeaderBlockError::State(err)
-    }
-}
-
 impl<T> From<Error> for RecvHeaderBlockError<T> {
     fn from(err: Error) -> Self {
-        RecvError::Connection(err).into()
+        RecvHeaderBlockError::State(err)
     }
 }

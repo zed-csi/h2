@@ -1,4 +1,5 @@
 use crate::codec::{SendError, UserError};
+use crate::frame::StreamId;
 use crate::proto::{self, Initiator};
 
 use std::sync::Arc;
@@ -23,8 +24,11 @@ pub struct Error {
 
 #[derive(Debug)]
 enum Kind {
-    /// A protocol error.
-    Reset(Reason, Initiator),
+    /// A RST_STREAM frame was received or sent.
+    Reset(StreamId, Reason, Initiator),
+
+    /// A GO_AWAY frame was received or sent.
+    GoAway(Reason, Initiator),
 
     /// An error resulting from an invalid action taken by the user of this
     /// library.
@@ -43,7 +47,7 @@ impl Error {
     /// action taken by the peer (i.e. a protocol error).
     pub fn reason(&self) -> Option<Reason> {
         match self.kind {
-            Kind::Reset(reason, _) => Some(reason),
+            Kind::GoAway(reason, _) => Some(reason),
             _ => None,
         }
     }
@@ -77,7 +81,8 @@ impl From<proto::Error> for Error {
 
         Error {
             kind: match src {
-                Reset(reason, initiator) => Kind::Reset(reason, initiator),
+                Reset(stream_id, reason, initiator) => Kind::Reset(stream_id, reason, initiator),
+                GoAway(reason, initiator) => Kind::GoAway(reason, initiator),
                 Io(e) => Kind::Io(e),
             },
         }
@@ -104,7 +109,12 @@ impl From<UserError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self.kind {
-            Kind::Reset(ref reason, initiator) => write!(fmt, "{} error: {}", initiator, reason),
+            Kind::Reset(_, reason, initiator) => {
+                write!(fmt, "stream reset from {}: {}", initiator, reason)
+            }
+            Kind::GoAway(reason, initiator) => {
+                write!(fmt, "go away from {}: {}", initiator, reason)
+            }
             Kind::User(ref e) => write!(fmt, "user error: {}", e),
             Kind::Io(ref e) => e.fmt(fmt),
         }

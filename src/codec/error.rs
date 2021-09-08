@@ -1,14 +1,6 @@
-use crate::frame::{Reason, StreamId};
 use crate::proto::Error;
 
 use std::{error, fmt, io};
-
-/// Errors that are received
-#[derive(Debug)]
-pub enum RecvError {
-    Connection(Error),
-    Stream { id: StreamId, reason: Reason },
-}
 
 /// Errors caused by sending a message
 #[derive(Debug)]
@@ -60,25 +52,6 @@ pub enum UserError {
 
     /// Tries to send push promise to peer who has disabled server push
     PeerDisabledServerPush,
-}
-
-// ===== impl RecvError =====
-
-impl From<io::Error> for RecvError {
-    fn from(src: io::Error) -> Self {
-        Self::Connection(src.into())
-    }
-}
-
-impl error::Error for RecvError {}
-
-impl fmt::Display for RecvError {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Self::Connection(ref e) => e.fmt(fmt),
-            Self::Stream { ref reason, .. } => reason.fmt(fmt),
-        }
-    }
 }
 
 // ===== impl SendError =====

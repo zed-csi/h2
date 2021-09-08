@@ -1,7 +1,7 @@
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
-use crate::codec::{Codec, RecvError, SendError, UserError};
+use crate::codec::{Codec, SendError, UserError};
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
@@ -297,13 +297,13 @@ where
 }
 
 impl<B> DynStreams<'_, B> {
-    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), RecvError> {
+    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
 
         me.recv_headers(self.peer, &self.send_buffer, frame)
     }
 
-    pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), RecvError> {
+    pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         me.recv_data(self.peer, &self.send_buffer, frame)
     }
@@ -320,7 +320,7 @@ impl<B> DynStreams<'_, B> {
         me.handle_error(&self.send_buffer, err)
     }
 
-    pub fn recv_go_away(&mut self, frame: &frame::GoAway) -> Result<(), RecvError> {
+    pub fn recv_go_away(&mut self, frame: &frame::GoAway) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         me.recv_go_away(&self.send_buffer, frame)
     }
@@ -334,7 +334,7 @@ impl<B> DynStreams<'_, B> {
         me.recv_window_update(&self.send_buffer, frame)
     }
 
-    pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), RecvError> {
+    pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         me.recv_push_promise(&self.send_buffer, frame)
     }
@@ -375,7 +375,7 @@ impl Inner {
         peer: peer::Dyn,
         send_buffer: &SendBuffer<B>,
         frame: frame::Headers,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         let id = frame.stream_id();
 
         // The GOAWAY process has begun. All streams with a greater ID than
@@ -405,10 +405,7 @@ impl Inner {
                             "recv_headers for old stream={:?}, sending STREAM_CLOSED",
                             id,
                         );
-                        return Err(RecvError::Stream {
-                            id,
-                            reason: Reason::STREAM_CLOSED,
-                        });
+                        return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
                     }
                 }
 
@@ -471,10 +468,7 @@ impl Inner {
 
                             Ok(())
                         } else {
-                            Err(RecvError::Stream {
-                                id: stream.id,
-                                reason: Reason::REFUSED_STREAM,
-                            })
+                            Err(Error::library_reset(stream.id, Reason::REFUSED_STREAM))
                         }
                     },
                     Err(RecvHeaderBlockError::State(err)) => Err(err),
@@ -484,10 +478,7 @@ impl Inner {
                     // Receiving trailers that don't set EOS is a "malformed"
                     // message. Malformed messages are a stream error.
                     proto_err!(stream: "recv_headers: trailers frame was not EOS; stream={:?}", stream.id);
-                    return Err(RecvError::Stream {
-                        id: stream.id,
-                        reason: Reason::PROTOCOL_ERROR,
-                    });
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
                 }
 
                 actions.recv.recv_trailers(frame, stream)
@@ -502,7 +493,7 @@ impl Inner {
         peer: peer::Dyn,
         send_buffer: &SendBuffer<B>,
         frame: frame::Data,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         let id = frame.stream_id();
 
         let stream = match self.store.find_mut(&id) {
@@ -529,14 +520,11 @@ impl Inner {
                     let sz = sz as WindowSize;
 
                     self.actions.recv.ignore_data(sz)?;
-                    return Err(RecvError::Stream {
-                        id,
-                        reason: Reason::STREAM_CLOSED,
-                    });
+                    return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
                 }
 
                 proto_err!(conn: "recv_data: stream not found; id={:?}", id);
-                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
         };
 
@@ -551,7 +539,7 @@ impl Inner {
             // Any stream error after receiving a DATA frame means
             // we won't give the data to the user, and so they can't
             // release the capacity. We do it automatically.
-            if let Err(RecvError::Stream { .. }) = res {
+            if let Err(Error::Reset(..)) = res {
                 actions
                     .recv
                     .release_connection_capacity(sz as WindowSize, &mut None);
@@ -674,7 +662,7 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         frame: &frame::GoAway,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         let actions = &mut self.actions;
         let counts = &mut self.counts;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
@@ -709,7 +697,7 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         frame: frame::PushPromise,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         let id = frame.stream_id();
         let promised_id = frame.promised_id();
 
@@ -1497,18 +1485,13 @@ impl Actions {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        res: Result<(), RecvError>,
-    ) -> Result<(), RecvError> {
-        if let Err(RecvError::Stream { reason, .. }) = res {
+        res: Result<(), Error>,
+    ) -> Result<(), Error> {
+        if let Err(Error::Reset(stream_id, reason, initiator)) = res {
+            debug_assert_eq!(stream_id, stream.id);
             // Reset the stream.
-            self.send.send_reset(
-                reason,
-                Initiator::Library,
-                buffer,
-                stream,
-                counts,
-                &mut self.task,
-            );
+            self.send
+                .send_reset(reason, initiator, buffer, stream, counts, &mut self.task);
             Ok(())
         } else {
             res

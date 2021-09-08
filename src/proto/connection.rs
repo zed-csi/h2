@@ -1,4 +1,4 @@
-use crate::codec::{RecvError, UserError};
+use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, frame, server};
 
@@ -201,8 +201,8 @@ where
 
         match (ours, theirs) {
             (Reason::NO_ERROR, Reason::NO_ERROR) => return Ok(()),
-            (ours, Reason::NO_ERROR) => Err(Error::Reset(ours, initiator)),
-            (_, theirs) => Err(Error::Reset(theirs, Initiator::Remote)),
+            (ours, Reason::NO_ERROR) => Err(Error::GoAway(ours, initiator)),
+            (_, theirs) => Err(Error::GoAway(theirs, Initiator::Remote)),
         }
     }
 
@@ -275,7 +275,7 @@ where
         }
     }
 
-    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), RecvError>> {
+    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
         // second (and thus, the clock wouldn't have changed enough to matter).
@@ -381,7 +381,7 @@ where
         self.streams.handle_error(Error::user_go_away(e));
     }
 
-    fn handle_poll2_result(&mut self, result: Result<(), RecvError>) -> Result<(), Error> {
+    fn handle_poll2_result(&mut self, result: Result<(), Error>) -> Result<(), Error> {
         match result {
             // The connection has shutdown normally
             Ok(()) => {
@@ -391,8 +391,8 @@ where
             // Attempting to read a frame resulted in a connection level
             // error. This is handled by setting a GOAWAY frame followed by
             // terminating the connection.
-            Err(RecvError::Connection(Error::Reset(reason, initiator))) => {
-                let e = Error::Reset(reason, initiator);
+            Err(Error::GoAway(reason, initiator)) => {
+                let e = Error::GoAway(reason, initiator);
                 tracing::debug!(error = ?e, "Connection::poll; connection error");
 
                 // We may have already sent a GOAWAY for this error,
@@ -411,7 +411,8 @@ where
             // Attempting to read a frame resulted in a stream level error.
             // This is handled by resetting the frame then trying to read
             // another frame.
-            Err(RecvError::Stream { id, reason }) => {
+            Err(Error::Reset(id, reason, initiator)) => {
+                debug_assert_eq!(initiator, Initiator::Library);
                 tracing::trace!(?id, ?reason, "stream error");
                 self.streams.send_reset(id, reason);
                 Ok(())
@@ -420,7 +421,7 @@ where
             // active streams must be reset.
             //
             // TODO: Are I/O errors recoverable?
-            Err(RecvError::Connection(Error::Io(e))) => {
+            Err(Error::Io(e)) => {
                 tracing::debug!(error = ?e, "Connection::poll; IO error");
                 let e = Error::Io(e);
 
@@ -433,7 +434,7 @@ where
         }
     }
 
-    fn recv_frame(&mut self, frame: Option<Frame>) -> Result<ReceivedFrame, RecvError> {
+    fn recv_frame(&mut self, frame: Option<Frame>) -> Result<ReceivedFrame, Error> {
         use crate::frame::Frame::*;
         match frame {
             Some(Headers(frame)) => {

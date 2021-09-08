@@ -1,4 +1,3 @@
-use crate::codec::RecvError;
 use crate::error::Reason;
 use crate::frame::{Pseudo, StreamId};
 use crate::proto::{Error, Open};
@@ -21,7 +20,7 @@ pub(crate) trait Peer {
         pseudo: Pseudo,
         fields: HeaderMap,
         stream_id: StreamId,
-    ) -> Result<Self::Poll, RecvError>;
+    ) -> Result<Self::Poll, Error>;
 
     fn is_local_init(id: StreamId) -> bool {
         assert!(!id.is_zero());
@@ -61,7 +60,7 @@ impl Dyn {
         pseudo: Pseudo,
         fields: HeaderMap,
         stream_id: StreamId,
-    ) -> Result<PollMessage, RecvError> {
+    ) -> Result<PollMessage, Error> {
         if self.is_server() {
             crate::server::Peer::convert_poll_message(pseudo, fields, stream_id)
                 .map(PollMessage::Server)
