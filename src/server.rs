@@ -1424,16 +1424,16 @@ impl proto::Peer for Peer {
 
         // A request translated from HTTP/1 must not include the :authority
         // header
-        if let Some(authority) = pseudo.authority {
-            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
-            parts.authority = Some(maybe_authority.or_else(|why| {
-                malformed!(
-                    "malformed headers: malformed authority ({:?}): {}",
-                    authority,
-                    why,
-                )
-            })?);
-        }
+        // if let Some(authority) = pseudo.authority {
+        //     let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+        //     parts.authority = Some(maybe_authority.or_else(|why| {
+        //         malformed!(
+        //             "malformed headers: malformed authority ({:?}): {}",
+        //             authority,
+        //             why,
+        //         )
+        //     })?);
+        // }
 
         // A :scheme is required, except CONNECT.
         if let Some(scheme) = pseudo.scheme {
